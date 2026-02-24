@@ -848,6 +848,23 @@ class CompactBar(tk.Tk):
 
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    import ctypes
+    from tkinter import messagebox
+    
+    # 互斥体名称，确保唯一
+    mutex_name = "WeChatOCR_Tool_Instance_Mutex"
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+    last_error = ctypes.windll.kernel32.GetLastError()
+    
+    if last_error == 183: # ERROR_ALREADY_EXISTS
+        # 创建一个临时隐藏的根窗口来弹窗
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showwarning("提示", "WeChat OCR 截图工具已经在运行中了！\\n请检查系统右下角托盘图标，切勿重复打开。")
+        root.destroy()
+        sys.exit(0)
+        
     app = CompactBar()
     app.mainloop()
 
