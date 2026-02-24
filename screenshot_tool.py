@@ -22,13 +22,20 @@ import sys
 #  路径配置
 # ─────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
-    SCRIPT_DIR = os.path.dirname(sys.executable)
+    # PyInstaller 单文件模式：资源解压到临时目录 sys._MEIPASS
+    _RES_DIR = sys._MEIPASS
 else:
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    _RES_DIR = os.path.dirname(os.path.abspath(__file__))
 
-WECHATOCR_EXE  = os.path.join(SCRIPT_DIR, "path", "WeChatOCR", "WeChatOCR.exe")
-WECHAT_LIB_DIR = os.path.join(SCRIPT_DIR, "path")
-TEMP_IMG       = os.path.join(SCRIPT_DIR, "_temp_screenshot.png")
+# 可写目录：%APPDATA%/wechatocr
+_appdata = os.getenv('APPDATA') or os.path.expanduser('~\\AppData\\Roaming')
+_WRITE_DIR = os.path.join(_appdata, 'wechatocr')
+os.makedirs(_WRITE_DIR, exist_ok=True)
+
+SCRIPT_DIR     = _WRITE_DIR          # 保持兼容（config.json 路径用）
+WECHATOCR_EXE  = os.path.join(_RES_DIR, "path", "WeChatOCR", "WeChatOCR.exe")
+WECHAT_LIB_DIR = os.path.join(_RES_DIR, "path")
+TEMP_IMG       = os.path.join(_WRITE_DIR, "_temp_screenshot.png")
 
 # ─────────────────────────────────────────────
 #  颜色主题
@@ -67,9 +74,14 @@ def do_ocr(image_path: str) -> str:
 import urllib.request, urllib.parse, urllib.error, json as _json
 import hmac, hashlib, time as _time
 
-ENGINES = ["百度翻译", "有道翻译", "MyMemory"]
+ENGINES = ["腾讯翻译", "百度翻译", "有道翻译", "MyMemory"]
 
 # 语言代码映射
+_TENCENT_LANG = {
+    "zh": "zh", "en": "en", "ja": "ja", "ko": "ko",
+    "fr": "fr", "de": "de", "es": "es", "ru": "ru",
+    "th": "th", "vi": "vi",
+}
 _BAIDU_LANG   = {"zh":"zh","en":"en","ja":"jp","ko":"kor","fr":"fra","de":"de","es":"spa","ru":"ru","th":"th","vi":"vie"}
 _YOUDAO_LANG  = {"zh":"zh-CHS","en":"en","ja":"ja","ko":"ko","fr":"fr","de":"de","es":"es","ru":"ru","th":"th","vi":"vi"}
 
@@ -80,6 +92,53 @@ def _load_config() -> dict:
             return _json.load(f)
     except Exception:
         return {}
+
+
+def _translate_tencent(text: str, to_lang: str) -> str:
+    """腾讯云机器翻译 API，TC3-HMAC-SHA256 签名"""
+    cfg        = _load_config().get("tencent", {})
+    secret_id  = cfg.get("secret_id",  "")
+    secret_key = cfg.get("secret_key", "")
+    region     = cfg.get("region", "ap-beijing")
+    if not secret_id or not secret_key or "填入" in secret_id:
+        return ""   # 密鑰未配置
+
+    to      = _TENCENT_LANG.get(to_lang, to_lang)
+    payload = _json.dumps({"SourceText": text[:2000], "Source": "auto",
+                           "Target": to, "ProjectId": 0}, ensure_ascii=False)
+    host    = "tmt.tencentcloudapi.com"
+    service = "tmt"
+    ts      = int(_time.time())
+    date    = _time.strftime("%Y-%m-%d", _time.gmtime(ts))
+
+    hp  = hashlib.sha256(payload.encode()).hexdigest()
+    ch  = f"content-type:application/json; charset=utf-8\nhost:{host}\n"
+    sh  = "content-type;host"
+    cr  = "\n".join(["POST", "/", "", ch, sh, hp])
+    cs  = f"{date}/{service}/tc3_request"
+    hcr = hashlib.sha256(cr.encode()).hexdigest()
+    s2s = "\n".join(["TC3-HMAC-SHA256", str(ts), cs, hcr])
+
+    def _h(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    sk  = _h(_h(_h(("TC3"+secret_key).encode(), date), service), "tc3_request")
+    sig = hmac.new(sk, s2s.encode(), hashlib.sha256).hexdigest()
+    auth = (f"TC3-HMAC-SHA256 Credential={secret_id}/{cs}, "
+            f"SignedHeaders={sh}, Signature={sig}")
+    try:
+        req = urllib.request.Request(
+            f"https://{host}", data=payload.encode(),
+            headers={"Authorization": auth,
+                     "Content-Type": "application/json; charset=utf-8",
+                     "Host": host, "X-TC-Action": "TextTranslate",
+                     "X-TC-Timestamp": str(ts), "X-TC-Version": "2018-03-21",
+                     "X-TC-Region": region})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            obj = _json.loads(resp.read().decode())
+        return obj.get("Response", {}).get("TargetText", "")
+    except Exception:
+        return ""
 
 
 def _translate_baidu(text: str, to_lang: str) -> str:
@@ -156,11 +215,12 @@ def _translate_mymemory(text: str, to_lang: str) -> str:
         return ""
 
 
-def do_translate(text: str, target_lang: str, engine: str = "百度翻译") -> str:
+def do_translate(text: str, target_lang: str, engine: str = "腾讯翻译") -> str:
     if not text.strip() or text.startswith("[OCR 错误]"):
         return "（无内容可翻译）"
 
     funcs = {
+        "腾讯翻译": _translate_tencent,
         "百度翻译": _translate_baidu,
         "有道翻译": _translate_youdao,
         "MyMemory": _translate_mymemory,
@@ -173,7 +233,8 @@ def do_translate(text: str, target_lang: str, engine: str = "百度翻译") -> s
             if result and result.strip():
                 tag = f"[降级至 {eng}]\n" if eng != engine else ""
                 return tag + result
-    return "[翻译失败：百度/有道/MyMemory 均不可达，请检查网络]"
+
+    return "（已收到识别结果直接展示）\n\n[翻译失败：所有免费接口（百度/有道/MyMemory）均不可达或被频率限制，请稍微检查网络后再试]"
 
 # ─────────────────────────────────────────────
 #  截图选区（tkinter 全屏遮罩）
@@ -351,6 +412,38 @@ class InPlaceOverlay(Toplevel):
         if self._mode == "translate":
             self._text_var.set(text)
             self._lbl.config(fg="#111111")
+            
+            # 手动更新一次来计算最新的宽高
+            self.update_idletasks()
+            w = self.winfo_width()
+            sw = self.winfo_screenwidth()
+            
+            # 限制 wraplength 避免文字冲出窗口并防止其本身变得过大
+            self._lbl.config(wraplength=max(200, w - 20))
+            self.update_idletasks()
+            
+            # 高度适配：避免多行文本显示不全
+            req_h = self._lbl.winfo_reqheight() + 16
+            new_h = max(self._win_h, req_h)
+            
+            # 再次检查并修复超出右边界的位置问题
+            new_w = max(w, self.winfo_width())
+            x = self.winfo_x()
+            y = self.winfo_y()
+            if x + new_w > sw - 10:
+                x = max(10, sw - new_w - 10)
+            
+            self.geometry(f"{new_w}x{new_h}+{x}+{y}")
+            self._win_h = new_h
+            
+            # 移动工具栏
+            if getattr(self, "_toolbar", None):
+                tb_w, tb_h = 240, 34
+                tx = x + (new_w - tb_w) // 2
+                ty = y + new_h + 3
+                if ty + tb_h > self.winfo_screenheight() - 10:
+                    ty = y - tb_h - 3
+                self._toolbar.geometry(f"{tb_w}x{tb_h}+{tx}+{ty}")
 
     def _show_ocr(self):
         if self._ocr_txt:
@@ -409,9 +502,16 @@ class CompactBar(tk.Tk):
 
         self._tray   = None
         self._dx = self._dy = 0
-        self.engine_var = StringVar(self, value="百度翻译")
+        self.engine_var = StringVar(self, value="腾讯翻译")
         self.lang_var   = StringVar(self, value="zh")
         self._dpi_scale = self._calc_dpi()
+        
+        # 设置窗口图标
+        ico_path = os.path.join(_RES_DIR, "icon.ico")
+        try:
+            self.iconbitmap(ico_path)
+        except Exception:
+            pass
 
         # 屏幕上方居中初始位置
         self.update_idletasks()
@@ -489,12 +589,18 @@ class CompactBar(tk.Tk):
     def _setup_tray(self):
         if not _PYSTRAY:
             return
-        from PIL import ImageDraw as _IDraw
-        sz  = 64
-        ico = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
-        d   = _IDraw.Draw(ico)
-        d.ellipse([2, 2, sz-2, sz-2], fill="#7c6af7")
-        d.text((12, 18), "OCR", fill="white")
+        
+        ico_path = os.path.join(_RES_DIR, "icon.ico")
+        try:
+            ico = Image.open(ico_path)
+        except Exception:
+            # 兼容处理
+            from PIL import ImageDraw as _IDraw
+            sz  = 64
+            ico = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+            d   = _IDraw.Draw(ico)
+            d.ellipse([2, 2, sz-2, sz-2], fill="#7c6af7")
+            d.text((12, 18), "OCR", fill="white")
 
         menu = _pystray.Menu(
             # default=True 在 Windows 下绑定双击事件
@@ -609,12 +715,40 @@ class CompactBar(tk.Tk):
         OptionMenu(row2, self.lang_var,
                    "zh","en","ja","ko","fr","de","es","ru","th","vi").pack(side=tk.LEFT, padx=4)
 
-        tk.Button(d, text="保存并关闭", bg=ACCENT, fg=BTN_FG,
+        tc_frame = tk.Frame(d, bg=BG)
+        cfg = _load_config().get("tencent", {})
+        tk.Label(tc_frame, text="SecretId:", bg=BG, fg=TEXT, font=("微软雅黑", 9)).pack(anchor="w", padx=24)
+        id_entry = tk.Entry(tc_frame, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief=tk.FLAT, font=("微软雅黑", 9))
+        id_entry.pack(fill=tk.X, padx=24, pady=2)
+        id_entry.insert(0, cfg.get("secret_id", ""))
+        tk.Label(tc_frame, text="SecretKey:", bg=BG, fg=TEXT, font=("微软雅黑", 9)).pack(anchor="w", padx=24, pady=(4,0))
+        key_entry = tk.Entry(tc_frame, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief=tk.FLAT, font=("微软雅黑", 9), show="*")
+        key_entry.pack(fill=tk.X, padx=24, pady=2)
+        key_entry.insert(0, cfg.get("secret_key", ""))
+
+        def _update_tc_frame(*args):
+            if self.engine_var.get() == "腾讯翻译":
+                tc_frame.pack(fill=tk.X, pady=6)
+            else:
+                tc_frame.pack_forget()
+
+        self.engine_var.trace_add("write", _update_tc_frame)
+        _update_tc_frame() # initial call
+
+        btn_frame = tk.Frame(d, bg=BG)
+        btn_frame.pack(pady=10)
+
+        tk.Button(btn_frame, text="保存并关闭", bg=ACCENT, fg=BTN_FG,
                   font=("微软雅黑", 10), bd=0, padx=16, pady=6,
-                  cursor="hand2", command=lambda: save_and_close(d)).pack(pady=10)
+                  cursor="hand2", command=lambda: save_and_close(d)).pack()
 
         def save_and_close(window):
             new_cfg = _load_config()
+            new_cfg["tencent"] = {
+                "secret_id": id_entry.get().strip(),
+                "secret_key": key_entry.get().strip(),
+                "region": cfg.get("region", "ap-beijing")
+            }
             new_cfg["hotkeys"] = {
                 "translate": hk1_entry.get().strip() or "alt+1",
                 "ocr": hk2_entry.get().strip() or "alt+2"
