@@ -1,0 +1,11 @@
+{
+    "tencent": {
+        "secret_id": "",
+        "secret_key": "",
+        "region": "ap-beijing"
+    },
+    "hotkeys": {
+        "translate": "alt+1",
+        "ocr": "alt+2"
+    }
+}
