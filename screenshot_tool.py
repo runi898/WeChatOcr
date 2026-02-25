@@ -519,8 +519,10 @@ class CompactBar(tk.Tk):
         self.geometry(f"+{(sw - 330) // 2}+0")
 
         self._build()
+        self._registered_hotkeys = {}   # 记录已注册热键 {action: combo}
         self._register_hotkeys()
         self._setup_tray()
+        self._hotkey_watchdog()          # 启动热键看门狗
 
     # ── DPI ──────────────────────────────────
     def _calc_dpi(self):
@@ -580,10 +582,59 @@ class CompactBar(tk.Tk):
             cfg = _load_config().get("hotkeys", {})
             h1 = cfg.get("translate", "alt+1")
             h2 = cfg.get("ocr", "alt+2")
+            keyboard.unhook_all()   # 先清空旧钩子，防止重复注册
             keyboard.add_hotkey(h1, lambda: self.after(0, lambda: self._cap("translate")))
             keyboard.add_hotkey(h2, lambda: self.after(0, lambda: self._cap("ocr")))
+            self._registered_hotkeys = {"translate": h1, "ocr": h2}
         except Exception as ex:
             print(f"[热键注册失败] {ex}（需要管理员权限，或快捷键冲突）")
+
+    def _hotkey_watchdog(self):
+        """每 5 秒检查一次 keyboard 钩子是否存活，失效时自动重新注册。
+
+        Windows 低级键盘钩子（SetWindowsHookEx）在以下情况会静默失效：
+          - 系统 UAC 弹窗 / 安全桌面切换
+          - 全屏游戏/程序抢占输入焦点
+          - 宿主线程消息队列积压超时（系统会自动移除钩子）
+
+        双重检测策略：
+          1. 检查 keyboard 内部监听线程是否仍在运行
+          2. 检查已注册热键回调表是否非空
+        任一条件不满足且曾注册过热键，则触发重注册。
+        """
+        def _check():
+            needs_reregister = False
+            try:
+                # 检测1：keyboard 内部监听线程是否还活着
+                listener = getattr(keyboard, '_listener', None)
+                if listener is not None:
+                    thread = getattr(listener, 'thread', None)
+                    if thread is not None and not thread.is_alive():
+                        needs_reregister = True
+                        print("[热键看门狗] 监听线程已死亡，重新注册...")
+
+                # 检测2：keyboard 内部已注册的热键回调表是否为空
+                if not needs_reregister:
+                    hotkeys = getattr(keyboard, '_hotkeys', {})
+                    if not hotkeys and self._registered_hotkeys:
+                        needs_reregister = True
+                        print("[热键看门狗] 热键回调表为空，重新注册...")
+
+            except Exception:
+                needs_reregister = True
+
+            if needs_reregister and self._registered_hotkeys:
+                try:
+                    self._register_hotkeys()
+                except Exception as ex:
+                    print(f"[热键看门狗] 重注册失败: {ex}")
+
+        try:
+            _check()
+        except Exception:
+            pass
+        # 每 5000ms 再次检查（使用 tkinter after，运行在主线程，线程安全）
+        self.after(5000, self._hotkey_watchdog)
 
     # ── 系统托盘 ─────────────────────────────
     def _setup_tray(self):
