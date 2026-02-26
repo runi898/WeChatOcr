@@ -97,17 +97,31 @@ BTN_FG  = "#ffffff"
 #  OCR 核心
 # ─────────────────────────────────────────────
 def do_ocr(image_path: str) -> str:
+    res = do_ocr_raw(image_path)
+    if isinstance(res, str):
+        return res
+    lines = [item["text"] for item in res if item["text"].strip()]
+    return "\n".join(lines) if lines else "（未识别到文字）"
+
+def do_ocr_raw(image_path: str):
+    """返回原始结果: [{'text': 'abc', 'left': x, 'top': y, 'right': x, 'bottom': y}, ...]"""
     try:
         wcocr.init(WECHATOCR_EXE, WECHAT_LIB_DIR)
         result = wcocr.ocr(image_path)
-        lines = []
+        items = []
         for item in result.get("ocr_response", []):
             text = item.get("text", "")
             if isinstance(text, bytes):
                 text = text.decode("utf-8", errors="ignore")
             if text.strip():
-                lines.append(text)
-        return "\n".join(lines) if lines else "（未识别到文字）"
+                items.append({
+                    "text": text,
+                    "left": item.get("left", 0),
+                    "top": item.get("top", 0),
+                    "right": item.get("right", 0),
+                    "bottom": item.get("bottom", 0)
+                })
+        return items
     except Exception as e:
         return f"[OCR 错误] {e}"
 
@@ -282,7 +296,7 @@ def do_translate(text: str, target_lang: str, engine: str = "腾讯翻译") -> s
 # ─────────────────────────────────────────────
 #  截图选区（tkinter 全屏遮罩）
 # ─────────────────────────────────────────────
-def grab_region(app, callback):
+def grab_region(app, callback, mode_name=""):
     """在主线程中打开截图遮罩，完成后调用 callback(image_path)
     支持多显示器：遮罩覆盖全部屏幕（含副屏/负坐标显示器）
     支持右键或 ESC 取消截图
@@ -320,9 +334,14 @@ def grab_region(app, callback):
         canvas.pack(fill=tk.BOTH, expand=True)
 
         # 提示文字（显示在虚拟屏幕中心）
+        hint_str = "拖动鼠标框选区域"
+        if mode_name:
+            hint_str = f"[{mode_name}] " + hint_str
+        hint_str += "  ·  右键 或 ESC 取消"
+        
         canvas.create_text(
             vw // 2, vh // 2,
-            text="拖动鼠标框选区域  ·  右键 或 ESC 取消",
+            text=hint_str,
             fill="#ffffff", font=("微软雅黑", 18), tags="hint"
         )
 
@@ -426,6 +445,7 @@ class InPlaceOverlay(Toplevel):
         self._tr_txt  = ""
         self._parent  = parent
         self._toolbar = None
+        self._trans_labels = []
 
         sw = parent.winfo_screenwidth()
         sh = parent.winfo_screenheight()
@@ -490,27 +510,93 @@ class InPlaceOverlay(Toplevel):
         if self._mode == "ocr":
             self._text_var.set(text)
 
-    def set_trans(self, text: str):
+    def set_trans(self, text: str, items=None):
         self._tr_txt = text
         if self._mode == "translate":
-            self._text_var.set(text)
             self._lbl.config(fg="#111111")
             
-            # 手动更新一次来计算最新的宽高
-            self.update_idletasks()
+            # 清理旧的独立标签
+            for lbl in self._trans_labels:
+                lbl.destroy()
+            self._trans_labels.clear()
+            
+            # 基础宽高
             w = self.winfo_width()
             sw = self.winfo_screenwidth()
             
-            # 限制 wraplength 避免文字冲出窗口并防止其本身变得过大
-            self._lbl.config(wraplength=max(200, w - 20))
-            self.update_idletasks()
-            
-            # 高度适配：避免多行文本显示不全
-            req_h = self._lbl.winfo_reqheight() + 16
+            # ========================
+            # 多排版智能渲染（如果有坐标+行数对应）
+            # ========================
+            if items:
+                # 把原文和翻译结果按行拆分进行数量比对
+                translated_lines = [l.strip() for l in text.split("\n") if l.strip()]
+                original_lines = [item for item in items if item.get("text", "").strip()]
+                
+                if len(translated_lines) == len(original_lines) and len(original_lines) > 0:
+                    # ✅ 美好情况：翻译结果的行数和原文一致！完美执行原位覆盖！
+                    # 我们先把原本用于显示大段落的大 Label 隐藏掉：
+                    self._text_var.set("")
+                    self._lbl.config(wraplength=0) # 禁用
+                    
+                    # 为了确定新窗口大小，追踪最底部的文字边界
+                    max_bottom = 0
+                    min_left = sw
+                    max_right = 0
+                    
+                    for idx, item in enumerate(original_lines):
+                        t_txt = translated_lines[idx]
+                        
+                        # 解析原本的坐标
+                        left = int(item["left"])
+                        top = int(item["top"])
+                        right = int(item["right"])
+                        bot = int(item["bottom"])
+                        
+                        # 行高和最大宽度
+                        row_h = bot - top
+                        row_w = max(50, right - left) # 宽度给足一点
+                        
+                        # 为了避免完全遮挡原来图片的间隙，给个细微修正
+                        lbl = tk.Label(self, text=t_txt,
+                                     bg="#eef2f5", fg="#111111", 
+                                     font=("微软雅黑", max(9, min(14, int(row_h * 0.7)))),
+                                     justify=tk.LEFT, anchor="nw", 
+                                     wraplength=row_w + 100)
+                        
+                        # 覆盖在原图片的准确位置上，向外拓宽一点点视觉效果更好
+                        x_pos = max(0, left - 4)
+                        y_pos = max(0, top - 2)
+                        
+                        lbl.place(x=x_pos, y=y_pos)
+                        self._trans_labels.append(lbl)
+                        
+                        lbl.update_idletasks()
+                        l_reqh = lbl.winfo_reqheight()
+                        
+                        max_bottom = max(max_bottom, y_pos + l_reqh)
+                        min_left = min(min_left, x_pos)
+                        max_right = max(max_right, x_pos + lbl.winfo_reqwidth())
+                        
+                    req_h = max_bottom + 16
+                    new_w = max(w, max_right - min_left + 10)
+                else:
+                    # ❌ 糟糕情况：遇到大长句，翻译引擎把它合并成了1段或重新分段了。
+                    # 回退到我们以前的中心展示模式
+                    self._text_var.set(text)
+                    self._lbl.config(wraplength=max(200, w - 20))
+                    self.update_idletasks()
+                    req_h = self._lbl.winfo_reqheight() + 16
+                    new_w = w
+            else:
+                self._text_var.set(text)
+                self._lbl.config(wraplength=max(200, w - 20))
+                self.update_idletasks()
+                req_h = self._lbl.winfo_reqheight() + 16
+                new_w = w
+
             new_h = max(self._win_h, req_h)
+            new_w = max(new_w, self.winfo_width())
             
-            # 再次检查并修复超出右边界的位置问题
-            new_w = max(w, self.winfo_width())
             x = self.winfo_x()
             y = self.winfo_y()
             if x + new_w > sw - 10:
@@ -519,7 +605,6 @@ class InPlaceOverlay(Toplevel):
             self.geometry(f"{new_w}x{new_h}+{x}+{y}")
             self._win_h = new_h
             
-            # 移动工具栏
             if getattr(self, "_toolbar", None):
                 tb_w, tb_h = 240, 34
                 tx = x + (new_w - tb_w) // 2
@@ -546,7 +631,7 @@ class InPlaceOverlay(Toplevel):
 
     def destroy(self):
         try:
-            if self._toolbar:
+            if getattr(self, "_toolbar", None):
                 self._toolbar.destroy()
                 self._toolbar = None
         except Exception:
@@ -634,7 +719,7 @@ class CompactBar(tk.Tk):
         self.bind("<Button-3>", lambda e: self.after(0, self._hotkeys_dialog))
         title.bind("<Button-3>", lambda e: self.after(0, self._hotkeys_dialog) or "break")
 
-        for label, mode in [("提取文字","ocr"), ("截  图","screenshot"), ("译","translate"), ("扫  码","qrcode")]:
+        for label, mode in [("提取文字","ocr"), ("截  图","screenshot"), ("译","translate"), ("扫  码","qrcode"), ("生成QR","gen_qr")]:
             self._div()
             self._bb(label, lambda m=mode: self._cap(m))
 
@@ -668,7 +753,8 @@ class CompactBar(tk.Tk):
             h2 = cfg.get("ocr", "alt+2")
             h3 = cfg.get("screenshot", "alt+3")
             h4 = cfg.get("qrcode", "alt+4")
-            _hklog(f"    准备注册: translate={h1!r}  ocr={h2!r} screenshot={h3!r} qrcode={h4!r}")
+            h5 = cfg.get("gen_qr", "alt+5")
+            _hklog(f"    准备注册: translate={h1!r}  ocr={h2!r} screenshot={h3!r} qrcode={h4!r} gen_qr={h5!r}")
             keyboard.unhook_all()   # 先清空旧钩子，防止重复注册
             if hasattr(keyboard, '_hotkeys'):
                 keyboard._hotkeys.clear()  # 手动清空内部字典，防止无限膨胀
@@ -677,7 +763,8 @@ class CompactBar(tk.Tk):
             keyboard.add_hotkey(h2, lambda: self.after(0, lambda: self._cap("ocr")))
             keyboard.add_hotkey(h3, lambda: self.after(0, lambda: self._cap("screenshot")))
             keyboard.add_hotkey(h4, lambda: self.after(0, lambda: self._cap("qrcode")))
-            self._registered_hotkeys = {"translate": h1, "ocr": h2, "screenshot": h3, "qrcode": h4}
+            keyboard.add_hotkey(h5, lambda: self.after(0, lambda: self._cap("gen_qr")))
+            self._registered_hotkeys = {"translate": h1, "ocr": h2, "screenshot": h3, "qrcode": h4, "gen_qr": h5}
             _hklog(f"    热键注册成功: {self._registered_hotkeys}")
         except Exception as ex:
             _hklog(f"!!! 热键注册失败: {ex}", "error")
@@ -815,7 +902,7 @@ class CompactBar(tk.Tk):
         d.configure(bg=BG)
         d.resizable(False, False)
         d.attributes("-topmost", True)
-        d.geometry("380x520")
+        d.geometry("380x560")
         
         def _on_close():
             self._hd_open = False
@@ -881,6 +968,14 @@ class CompactBar(tk.Tk):
         hk4_entry.insert(0, cfg_hk.get("qrcode", "alt+4"))
         _bind_hk_recorder(hk4_entry)
 
+        row5 = tk.Frame(d, bg=BG)
+        row5.pack(fill=tk.X, padx=30, pady=3)
+        tk.Label(row5, text="生成二维码:", bg=BG, fg=TEXT, font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        hk5_entry = tk.Entry(row5, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief=tk.FLAT, font=("微软雅黑", 9), width=15)
+        hk5_entry.pack(side=tk.RIGHT)
+        hk5_entry.insert(0, cfg_hk.get("gen_qr", "alt+5"))
+        _bind_hk_recorder(hk5_entry)
+
         tk.Frame(d, bg=BORDER, height=1).pack(fill=tk.X, padx=16, pady=6)
         tk.Label(d, text="🌐  翻译设置", bg=BG, fg=ACCENT,
                  font=("微软雅黑", 11, "bold")).pack()
@@ -937,7 +1032,8 @@ class CompactBar(tk.Tk):
                 "translate": hk1_entry.get().strip() or "alt+1",
                 "ocr": hk2_entry.get().strip() or "alt+2",
                 "screenshot": hk3_entry.get().strip() or "alt+3",
-                "qrcode": hk4_entry.get().strip() or "alt+4"
+                "qrcode": hk4_entry.get().strip() or "alt+4",
+                "gen_qr": hk5_entry.get().strip() or "alt+5"
             }
             try:
                 with open(os.path.join(SCRIPT_DIR, "config.json"), "w", encoding="utf-8") as f:
@@ -1037,8 +1133,22 @@ class CompactBar(tk.Tk):
             "translate":  self._run_ocr_translate,
             "screenshot": self._run_screenshot,
             "qrcode":     self._run_qrcode,
+            "gen_qr":     self._run_gen_qrcode,
         }
-        self.after(200, lambda: grab_region(self, cb_map.get(mode, self._run_ocr_only)))
+        name_map = {
+            "ocr":        "提取文字",
+            "translate":  "截图翻译",
+            "screenshot": "系统截图",
+            "qrcode":     "识别二维码",
+            "gen_qr":     "生成二维码",
+        }
+        action = cb_map.get(mode, self._run_ocr_only)
+        m_name = name_map.get(mode, "")
+
+        if mode == "gen_qr":
+            self.after(0, action)
+        else:
+            self.after(200, lambda: grab_region(self, action, mode_name=m_name))
 
     # ── 提取文字（OCR 复制）────────────────
     def _run_ocr_only(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
@@ -1076,10 +1186,30 @@ class CompactBar(tk.Tk):
             popup  = InPlaceOverlay(self, lx1, ly1, lx2, ly2, mode="translate")
 
             def worker():
-                text = do_ocr(img_path)
-                self.after(0, lambda: popup.set_ocr(text))
-                translated = do_translate(text, target_lang=lang, engine=engine)
-                self.after(0, lambda: popup.set_trans(translated))
+                # 使用 raw 返回来保留左、右、上、下的真实坐标点阵
+                res = do_ocr_raw(img_path)
+                
+                # 网络出错或者未能正常提取结果的分支
+                if isinstance(res, str):
+                    self.after(0, lambda: popup.set_ocr(res))
+                    self.after(0, lambda: popup.set_trans(f"识别或翻译中断。原因：{res}"))
+                    return
+                
+                # 处理所有的提取原文并使用换行符重组
+                lines = [item["text"] for item in res if item["text"].strip()]
+                if not lines:
+                    self.after(0, lambda: popup.set_ocr("未识别到文字（空）"))
+                    self.after(0, lambda: popup.set_trans("（无需翻译）"))
+                    return
+                    
+                full_text = "\n".join(lines)
+                self.after(0, lambda: popup.set_ocr(full_text))
+                
+                # 调用你已有的翻译接口，翻译这个带 \n 换行的长文本
+                translated = do_translate(full_text, target_lang=lang, engine=engine)
+                # 交给支持智能按坐标摆放的新 set_trans
+                self.after(0, lambda: popup.set_trans(translated, items=res))
+                
             threading.Thread(target=worker, daemon=True).start()
         self.after(0, _main)
 
@@ -1114,6 +1244,97 @@ class CompactBar(tk.Tk):
                     self.after(0, lambda: self._toast(f"扫码异常: {ex}"))
             threading.Thread(target=worker, daemon=True).start()
         self.after(0, _main)
+        
+    # ── 生成二维码 ───────────────────────────
+    def _run_gen_qrcode(self):
+        try:
+            content = pyperclip.paste().strip()
+            if not content:
+                content = "请输入要生成二维码的内容"
+        except Exception:
+            content = "请输入要生成二维码的内容"
+            
+        try:
+            import qrcode
+        except ImportError:
+            self.after(0, lambda: self._toast("你的电脑上没安装此功能所需的模块。\n不用担心，下次重启程序将自动恢复。"))
+            return
+            
+        w = Toplevel(self)
+        w.title("生成二维码")
+        w.configure(bg="#1e1e2e")
+        w.attributes("-topmost", True)
+        w.geometry(f"320x420+{self.winfo_x()}+{self.winfo_y() + self.winfo_height() + 10}")
+
+        img_lbl = tk.Label(w, bg="#1e1e2e")
+        img_lbl.pack(pady=20)
+        
+        entry = tk.Entry(w, bg="#11111b", fg="#cdd6f4", insertbackground="#cdd6f4", 
+                         font=("微软雅黑", 10), relief=tk.FLAT, justify="center")
+        entry.pack(fill=tk.X, padx=20, pady=10, ipady=4)
+        entry.insert(0, content)
+        
+        def _on_focus_in(event):
+            if entry.get() == "请输入要生成二维码的内容":
+                entry.delete(0, tk.END)
+                
+        entry.bind("<FocusIn>", _on_focus_in)
+        
+        btn_frame = tk.Frame(w, bg="#1e1e2e")
+        btn_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        from PIL import ImageTk
+        
+        def _update_qr(*_):
+            text = entry.get().strip() or "empty"
+            qr = qrcode.QRCode(version=1, box_size=8, border=2)
+            qr.add_data(text)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            
+            # 保存到临时文件
+            img_path = os.path.join(_WRITE_DIR, "_temp_qr.png")
+            img.save(img_path)
+            
+            photo = ImageTk.PhotoImage(img)
+            img_lbl.config(image=photo)
+            img_lbl.image = photo 
+            img_lbl.qr_path = img_path
+            
+        def _copy_img():
+            import subprocess
+            path = getattr(img_lbl, 'qr_path', '')
+            if not path or not os.path.exists(path): return
+            try:
+                ps = (f'Add-Type -AssemblyName System.Windows.Forms,System.Drawing;'
+                      f'[System.Windows.Forms.Clipboard]::SetImage('
+                      f'[System.Drawing.Image]::FromFile("{path}"))')
+                subprocess.run(["powershell", "-Command", ps], capture_output=True, timeout=6)
+                self._toast("✅ 二维码图片已复制到剪贴板")
+            except Exception as e:
+                self._toast(f"复制失败: {e}")
+                
+        def _save_img():
+            from tkinter import filedialog
+            path = getattr(img_lbl, 'qr_path', '')
+            if not path or not os.path.exists(path): return
+            tgt = filedialog.asksaveasfilename(defaultextension=".png", 
+                                             initialfile="qrcode.png",
+                                             filetypes=[("PNG图片", "*.png")])
+            if tgt:
+                import shutil
+                shutil.copy2(path, tgt)
+                self._toast("✅ 二维码已保存")
+
+        _update_qr()
+        entry.bind("<KeyRelease>", _update_qr)
+        
+        tk.Button(btn_frame, text="复制图片", bg="#f5a623", fg="#1a1a1a", 
+                  font=("微软雅黑", 9, "bold"), bd=0, cursor="hand2", padx=10, pady=5, 
+                  command=_copy_img).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+        tk.Button(btn_frame, text="另存为...", bg="#313244", fg="#cdd6f4", 
+                  font=("微软雅黑", 9), bd=0, cursor="hand2", padx=10, pady=5, 
+                  command=_save_img).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(5, 0))
 
     # ── Toast 通知 ───────────────────────────
     def _toast(self, msg: str, ms: int = 2500):
