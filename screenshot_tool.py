@@ -634,7 +634,7 @@ class CompactBar(tk.Tk):
         self.bind("<Button-3>", lambda e: self.after(0, self._hotkeys_dialog))
         title.bind("<Button-3>", lambda e: self.after(0, self._hotkeys_dialog) or "break")
 
-        for label, mode in [("提取文字","ocr"), ("截  图","screenshot"), ("译","translate")]:
+        for label, mode in [("提取文字","ocr"), ("截  图","screenshot"), ("译","translate"), ("扫  码","qrcode")]:
             self._div()
             self._bb(label, lambda m=mode: self._cap(m))
 
@@ -666,14 +666,18 @@ class CompactBar(tk.Tk):
             cfg = _load_config().get("hotkeys", {})
             h1 = cfg.get("translate", "alt+1")
             h2 = cfg.get("ocr", "alt+2")
-            _hklog(f"    准备注册: translate={h1!r}  ocr={h2!r}")
+            h3 = cfg.get("screenshot", "alt+3")
+            h4 = cfg.get("qrcode", "alt+4")
+            _hklog(f"    准备注册: translate={h1!r}  ocr={h2!r} screenshot={h3!r} qrcode={h4!r}")
             keyboard.unhook_all()   # 先清空旧钩子，防止重复注册
             if hasattr(keyboard, '_hotkeys'):
                 keyboard._hotkeys.clear()  # 手动清空内部字典，防止无限膨胀
             _hklog("    unhook_all() 完成")
             keyboard.add_hotkey(h1, lambda: self.after(0, lambda: self._cap("translate")))
             keyboard.add_hotkey(h2, lambda: self.after(0, lambda: self._cap("ocr")))
-            self._registered_hotkeys = {"translate": h1, "ocr": h2}
+            keyboard.add_hotkey(h3, lambda: self.after(0, lambda: self._cap("screenshot")))
+            keyboard.add_hotkey(h4, lambda: self.after(0, lambda: self._cap("qrcode")))
+            self._registered_hotkeys = {"translate": h1, "ocr": h2, "screenshot": h3, "qrcode": h4}
             _hklog(f"    热键注册成功: {self._registered_hotkeys}")
         except Exception as ex:
             _hklog(f"!!! 热键注册失败: {ex}", "error")
@@ -811,7 +815,7 @@ class CompactBar(tk.Tk):
         d.configure(bg=BG)
         d.resizable(False, False)
         d.attributes("-topmost", True)
-        d.geometry("380x440")
+        d.geometry("380x520")
         
         def _on_close():
             self._hd_open = False
@@ -860,6 +864,22 @@ class CompactBar(tk.Tk):
         hk2_entry.pack(side=tk.RIGHT)
         hk2_entry.insert(0, cfg_hk.get("ocr", "alt+2"))
         _bind_hk_recorder(hk2_entry)
+
+        row3 = tk.Frame(d, bg=BG)
+        row3.pack(fill=tk.X, padx=30, pady=3)
+        tk.Label(row3, text="简单截图 (复制):", bg=BG, fg=TEXT, font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        hk3_entry = tk.Entry(row3, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief=tk.FLAT, font=("微软雅黑", 9), width=15)
+        hk3_entry.pack(side=tk.RIGHT)
+        hk3_entry.insert(0, cfg_hk.get("screenshot", "alt+3"))
+        _bind_hk_recorder(hk3_entry)
+
+        row4 = tk.Frame(d, bg=BG)
+        row4.pack(fill=tk.X, padx=30, pady=3)
+        tk.Label(row4, text="识别二维码:", bg=BG, fg=TEXT, font=("微软雅黑", 9)).pack(side=tk.LEFT)
+        hk4_entry = tk.Entry(row4, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief=tk.FLAT, font=("微软雅黑", 9), width=15)
+        hk4_entry.pack(side=tk.RIGHT)
+        hk4_entry.insert(0, cfg_hk.get("qrcode", "alt+4"))
+        _bind_hk_recorder(hk4_entry)
 
         tk.Frame(d, bg=BORDER, height=1).pack(fill=tk.X, padx=16, pady=6)
         tk.Label(d, text="🌐  翻译设置", bg=BG, fg=ACCENT,
@@ -915,7 +935,9 @@ class CompactBar(tk.Tk):
             }
             new_cfg["hotkeys"] = {
                 "translate": hk1_entry.get().strip() or "alt+1",
-                "ocr": hk2_entry.get().strip() or "alt+2"
+                "ocr": hk2_entry.get().strip() or "alt+2",
+                "screenshot": hk3_entry.get().strip() or "alt+3",
+                "qrcode": hk4_entry.get().strip() or "alt+4"
             }
             try:
                 with open(os.path.join(SCRIPT_DIR, "config.json"), "w", encoding="utf-8") as f:
@@ -1014,6 +1036,7 @@ class CompactBar(tk.Tk):
             "ocr":        self._run_ocr_only,
             "translate":  self._run_ocr_translate,
             "screenshot": self._run_screenshot,
+            "qrcode":     self._run_qrcode,
         }
         self.after(200, lambda: grab_region(self, cb_map.get(mode, self._run_ocr_only)))
 
@@ -1057,6 +1080,38 @@ class CompactBar(tk.Tk):
                 self.after(0, lambda: popup.set_ocr(text))
                 translated = do_translate(text, target_lang=lang, engine=engine)
                 self.after(0, lambda: popup.set_trans(translated))
+            threading.Thread(target=worker, daemon=True).start()
+        self.after(0, _main)
+
+    # ── 扫码（微信 OpenCV QR） ────────────────
+    def _run_qrcode(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
+        def _main():
+            def worker():
+                try:
+                    import cv2
+                    import numpy as np
+                except ImportError:
+                    self.after(0, lambda: self._toast("缺少扫码引擎库。尝试在后台安装 opencv..."))
+                    return
+                try:
+                    detector = cv2.wechat_qrcode_WeChatQRCode()
+                    img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    if img is None:
+                        self.after(0, lambda: self._toast("读取截图失败"))
+                        return
+                    res, points = detector.detectAndDecode(img)
+                    if res:
+                        # 获取所有结果拼接
+                        text = "\n".join(res)
+                        pyperclip.copy(text)
+                        
+                        # 兼容多行通知的显示情况
+                        display_text = text if len(text) < 40 else text[:40] + "..."
+                        self.after(0, lambda: self._toast(f"✅ 已复制二维码内容:\n{display_text}", ms=3500))
+                    else:
+                        self.after(0, lambda: self._toast("未能从选区识别到二维码"))
+                except Exception as ex:
+                    self.after(0, lambda: self._toast(f"扫码异常: {ex}"))
             threading.Thread(target=worker, daemon=True).start()
         self.after(0, _main)
 
