@@ -37,6 +37,49 @@ WECHATOCR_EXE  = os.path.join(_RES_DIR, "path", "WeChatOCR", "WeChatOCR.exe")
 WECHAT_LIB_DIR = os.path.join(_RES_DIR, "path")
 TEMP_IMG       = os.path.join(_WRITE_DIR, "_temp_screenshot.png")
 
+HOTKEY_LOG = os.path.join(_WRITE_DIR, "hotkey_debug.log")
+
+def _kbd_state_snapshot():
+    try:
+        listener = getattr(keyboard, '_listener', None)
+        has_listener = (listener is not None)
+        
+        t_alive = False
+        if has_listener:
+            if hasattr(listener, 'listening_thread') and listener.listening_thread:
+                t_alive = listener.listening_thread.is_alive()
+            else:
+                t_alive = True # 兼容不同版本 keyboard，无法获取则默认存活
+                
+        hk_cnt = len(getattr(keyboard, '_hotkeys', {}))
+        
+        return f"[kbd状态] listener={has_listener} thread_alive={t_alive} hotkeys={hk_cnt}"
+    except Exception as e:
+        return f"[kbd状态] 获取失败({e})"
+
+def _hklog(msg: str, level: str = "info", with_kbd_state: bool = True):
+    """写入热键诊断日志，带时间戳、级别标签和可选的键盘系统状态快照"""
+    import datetime
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 限制日志大小，超过 2MB 则截断前一半（避免积留过大文件）
+    try:
+        if os.path.exists(HOTKEY_LOG) and os.path.getsize(HOTKEY_LOG) > 2 * 1024 * 1024:
+            with open(HOTKEY_LOG, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(HOTKEY_LOG, "w", encoding="utf-8") as f:
+                f.writelines(lines[len(lines)//2:])
+    except Exception:
+        pass
+
+    kbd_info = f"  {_kbd_state_snapshot()}" if with_kbd_state else ""
+    full_msg = f"{now} [{level.upper()}] {msg}{kbd_info}\n"
+
+    try:
+        with open(HOTKEY_LOG, "a", encoding="utf-8") as f:
+            f.write(full_msg)
+    except Exception:
+        pass
 # ─────────────────────────────────────────────
 #  颜色主题
 # ─────────────────────────────────────────────
@@ -240,25 +283,46 @@ def do_translate(text: str, target_lang: str, engine: str = "腾讯翻译") -> s
 #  截图选区（tkinter 全屏遮罩）
 # ─────────────────────────────────────────────
 def grab_region(app, callback):
-    """在主线程中打开截图遮罩，完成后调用 callback(image_path)"""
+    """在主线程中打开截图遮罩，完成后调用 callback(image_path)
+    支持多显示器：遮罩覆盖全部屏幕（含副屏/负坐标显示器）
+    支持右键或 ESC 取消截图
+    """
 
     def _open():
+        # ── 获取虚拟屏幕范围（所有显示器合并后的总区域）──────
+        try:
+            import ctypes
+            SM_XVIRTUALSCREEN  = 76   # 虚拟屏幕左边界（副屏在左时为负）
+            SM_YVIRTUALSCREEN  = 77   # 虚拟屏幕上边界（副屏在上时为负）
+            SM_CXVIRTUALSCREEN = 78   # 虚拟屏幕总宽度
+            SM_CYVIRTUALSCREEN = 79   # 虚拟屏幕总高度
+            u32 = ctypes.windll.user32
+            vx  = u32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            vy  = u32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            vw  = u32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            vh  = u32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        except Exception:
+            vx, vy = 0, 0
+            vw = app.winfo_screenwidth()
+            vh = app.winfo_screenheight()
+
         overlay = Toplevel(app)
-        overlay.attributes("-fullscreen", True)
-        overlay.attributes("-alpha", 0.25)
+        overlay.overrideredirect(True)                    # 无边框
+        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")         # 覆盖全部显示器
+        overlay.attributes("-alpha",   0.25)
         overlay.attributes("-topmost", True)
         overlay.configure(bg="black")
         overlay.lift()
         overlay.focus_force()
 
-        canvas = Canvas(overlay, cursor="cross", bg="black", highlightthickness=0)
+        canvas = Canvas(overlay, cursor="cross", bg="black",
+                        highlightthickness=0, width=vw, height=vh)
         canvas.pack(fill=tk.BOTH, expand=True)
 
-        # 提示文字
+        # 提示文字（显示在虚拟屏幕中心）
         canvas.create_text(
-            overlay.winfo_screenwidth() // 2,
-            overlay.winfo_screenheight() // 2,
-            text="拖动鼠标框选区域  ·  ESC 取消",
+            vw // 2, vh // 2,
+            text="拖动鼠标框选区域  ·  右键 或 ESC 取消",
             fill="#ffffff", font=("微软雅黑", 18), tags="hint"
         )
 
@@ -271,6 +335,7 @@ def grab_region(app, callback):
         def on_drag(e):
             if state["rect"]:
                 canvas.delete(state["rect"])
+            # e.x_root/y_root 是绝对屏幕坐标，转为 canvas 内坐标
             rx = state["sx"] - canvas.winfo_rootx()
             ry = state["sy"] - canvas.winfo_rooty()
             state["rect"] = canvas.create_rectangle(
@@ -290,18 +355,18 @@ def grab_region(app, callback):
                 app.after(0, lambda: app.status("框选区域太小，已取消"))
                 return
 
-            # 逻辑坐标（用于弹窗位置）
+            # 逻辑坐标（用于弹窗位置，可能包含<0的副屏坐标）
             lx1, ly1 = int(min(x1, x2)), int(min(y1, y2))
             lx2, ly2 = int(max(x1, x2)), int(max(y1, y2))
 
-            # DPI 缩放 → 物理像素（用于截图）
+            # DPI 缩放 → 物理像素（用于截图，all_screens=True 支持负坐标）
             sx, sy = app._dpi_scale
             bbox = (
                 int(lx1 * sx), int(ly1 * sy),
                 int(lx2 * sx), int(ly2 * sy),
             )
 
-            # 延迟 150ms 确保遗罩消失后再截图
+            # 延迟 150ms 确保遮罩消失后再截图
             def _do_grab():
                 import time
                 time.sleep(0.15)
@@ -312,10 +377,28 @@ def grab_region(app, callback):
 
             threading.Thread(target=_do_grab, daemon=True).start()
 
+        def _cancel(e=None):
+            overlay.destroy()
+            app.status("已取消截图")
+            return "break"
+
+        def _rclick_press(e):
+            return "break"   # 消耗右键按下事件，防止弹出底层的系统菜单
+
+        def _rclick_release(e):
+            return _cancel()
+
         canvas.bind("<ButtonPress-1>",   on_press)
         canvas.bind("<B1-Motion>",       on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
-        overlay.bind("<Escape>", lambda e: overlay.destroy())
+        
+        # 右键退出绑定（必须同时吸收 Press 和 Release，避免底层冒泡）
+        canvas.bind("<ButtonPress-3>",   _rclick_press)
+        canvas.bind("<ButtonRelease-3>", _rclick_release)
+        overlay.bind("<ButtonPress-3>",  _rclick_press)
+        overlay.bind("<ButtonRelease-3>",_rclick_release)
+        
+        overlay.bind("<Escape>", _cancel)
 
     app.after(0, _open)      # 必须在主线程调用 tkinter
 
@@ -578,19 +661,26 @@ class CompactBar(tk.Tk):
 
     # ── 热键 ─────────────────────────────────
     def _register_hotkeys(self):
+        _hklog(">>> _register_hotkeys() 调用开始")
         try:
             cfg = _load_config().get("hotkeys", {})
             h1 = cfg.get("translate", "alt+1")
             h2 = cfg.get("ocr", "alt+2")
+            _hklog(f"    准备注册: translate={h1!r}  ocr={h2!r}")
             keyboard.unhook_all()   # 先清空旧钩子，防止重复注册
+            if hasattr(keyboard, '_hotkeys'):
+                keyboard._hotkeys.clear()  # 手动清空内部字典，防止无限膨胀
+            _hklog("    unhook_all() 完成")
             keyboard.add_hotkey(h1, lambda: self.after(0, lambda: self._cap("translate")))
             keyboard.add_hotkey(h2, lambda: self.after(0, lambda: self._cap("ocr")))
             self._registered_hotkeys = {"translate": h1, "ocr": h2}
+            _hklog(f"    热键注册成功: {self._registered_hotkeys}")
         except Exception as ex:
+            _hklog(f"!!! 热键注册失败: {ex}", "error")
             print(f"[热键注册失败] {ex}（需要管理员权限，或快捷键冲突）")
 
     def _hotkey_watchdog(self):
-        """每 5 秒检查一次 keyboard 钩子是否存活，失效时自动重新注册。
+        """每 5 秒检查一次 keyboard 钩子是否存活，失效时自动重新注册并记录诊断日志。
 
         Windows 低级键盘钩子（SetWindowsHookEx）在以下情况会静默失效：
           - 系统 UAC 弹窗 / 安全桌面切换
@@ -598,41 +688,60 @@ class CompactBar(tk.Tk):
           - 宿主线程消息队列积压超时（系统会自动移除钩子）
 
         双重检测策略：
-          1. 检查 keyboard 内部监听线程是否仍在运行
-          2. 检查已注册热键回调表是否非空
+          1. 检查 keyboard 内部监听线程是否活着
+          2. 检查已注册热键回调表是否为空
         任一条件不满足且曾注册过热键，则触发重注册。
         """
+        # 看门狗计数器，每 60 次（约 5 分钟）写一次心跳日志
+        self._watchdog_tick = getattr(self, '_watchdog_tick', 0) + 1
+        write_heartbeat = (self._watchdog_tick % 60 == 1)
+
         def _check():
             needs_reregister = False
+            reason = ""
             try:
                 # 检测1：keyboard 内部监听线程是否还活着
                 listener = getattr(keyboard, '_listener', None)
+                t_alive = False
                 if listener is not None:
-                    thread = getattr(listener, 'thread', None)
-                    if thread is not None and not thread.is_alive():
-                        needs_reregister = True
-                        print("[热键看门狗] 监听线程已死亡，重新注册...")
+                    if hasattr(listener, 'listening_thread') and listener.listening_thread:
+                        t_alive = listener.listening_thread.is_alive()
+                    else:
+                        t_alive = True
 
-                # 检测2：keyboard 内部已注册的热键回调表是否为空
+                if listener is not None and not t_alive:
+                    needs_reregister = True
+                    reason = "监听线程已死亡"
+
+                # 检测2：热键回调表是否为空
                 if not needs_reregister:
-                    hotkeys = getattr(keyboard, '_hotkeys', {})
-                    if not hotkeys and self._registered_hotkeys:
+                    hk_dict = getattr(keyboard, '_hotkeys', {})
+                    if not hk_dict and self._registered_hotkeys:
                         needs_reregister = True
-                        print("[热键看门狗] 热键回调表为空，重新注册...")
+                        reason = "热键回调表(_hotkeys)意外置空"
 
-            except Exception:
+                # 心跳日志（每 5 分钟）
+                if write_heartbeat:
+                    _hklog(f"[心跳] tick={self._watchdog_tick} needs_reregister={needs_reregister}")
+
+            except Exception as ex:
                 needs_reregister = True
+                reason = f"看门狗检测异常: {ex}"
+                _hklog(f"!!! 看门狗检测异常: {ex}", "error")
 
             if needs_reregister and self._registered_hotkeys:
+                _hklog(f">>> 触发重注册，原因: {reason}", "warning")
+                print(f"[热键看门狗] {reason}，正在重新注册...")
                 try:
                     self._register_hotkeys()
                 except Exception as ex:
+                    _hklog(f"!!! 重注册失败: {ex}", "error")
                     print(f"[热键看门狗] 重注册失败: {ex}")
 
         try:
             _check()
-        except Exception:
-            pass
+        except Exception as ex:
+            _hklog(f"!!! _check() 未捕获异常: {ex}", "error")
         # 每 5000ms 再次检查（使用 tkinter after，运行在主线程，线程安全）
         self.after(5000, self._hotkey_watchdog)
 
@@ -791,7 +900,11 @@ class CompactBar(tk.Tk):
 
         tk.Button(btn_frame, text="保存并关闭", bg=ACCENT, fg=BTN_FG,
                   font=("微软雅黑", 10), bd=0, padx=16, pady=6,
-                  cursor="hand2", command=lambda: save_and_close(d)).pack()
+                  cursor="hand2", command=lambda: save_and_close(d)).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(btn_frame, text="📋 查看诊断日志", bg="#2a2a3e", fg="#a6adc8",
+                  font=("微软雅黑", 9), bd=0, padx=10, pady=6,
+                  cursor="hand2", command=self._show_log_dialog).pack(side=tk.LEFT, padx=6)
 
         def save_and_close(window):
             new_cfg = _load_config()
@@ -820,10 +933,83 @@ class CompactBar(tk.Tk):
             self._hd_open = False
             window.destroy()
 
+    # ── 诊断日志查看器 ────────────────────────
+    def _show_log_dialog(self):
+        """打开一个简单的日志查看窗口，显示 hotkey_debug.log 内容"""
+        lw = Toplevel(self)
+        lw.title(f"热键诊断日志  ({HOTKEY_LOG})")
+        lw.configure(bg=BG)
+        lw.geometry("780x480")
+        lw.attributes("-topmost", True)
+
+        # 顶部说明
+        info_frame = tk.Frame(lw, bg=BG)
+        info_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
+        tk.Label(info_frame, text="📄 热键诊断日志",
+                 bg=BG, fg=ACCENT, font=("微软雅黑", 11, "bold")).pack(side=tk.LEFT)
+        tk.Label(info_frame, text=f"  {HOTKEY_LOG}",
+                 bg=BG, fg=SUBTEXT, font=("微软雅黑", 8)).pack(side=tk.LEFT)
+
+        # 日志文本框
+        txt = ScrolledText(lw, bg="#0d0d1a", fg="#ccddcc",
+                           font=("Consolas", 9), wrap=tk.NONE,
+                           relief=tk.FLAT, padx=6, pady=6)
+        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+
+        def _load():
+            txt.config(state=tk.NORMAL)
+            txt.delete(1.0, tk.END)
+            try:
+                if os.path.exists(HOTKEY_LOG):
+                    with open(HOTKEY_LOG, "r", encoding="utf-8") as f:
+                        txt.insert(tk.END, f.read())
+                else:
+                    txt.insert(tk.END, "(日志文件尚不存在，还没产生过错误或运行记录。)\n")
+            except Exception as e:
+                txt.insert(tk.END, f"读取日志失败: {e}\n")
+            txt.see(tk.END)
+            txt.config(state=tk.DISABLED)
+
+        _load()
+
+        # 底部按钮区
+        bar = tk.Frame(lw, bg=BG)
+        bar.pack(fill=tk.X, padx=10, pady=6)
+
+        def _clear_log():
+            try:
+                if os.path.exists(HOTKEY_LOG):
+                    os.remove(HOTKEY_LOG)
+                _load()
+            except Exception as e:
+                pass
+
+        def _open_folder():
+            import subprocess
+            try:
+                subprocess.Popen(['explorer', '/select,', HOTKEY_LOG])
+            except Exception:
+                pass
+
+        tk.Button(bar, text="刷新", bg=PANEL, fg=TEXT,
+                  font=("微软雅黑", 9), bd=0, padx=10, pady=4,
+                  cursor="hand2", command=_load).pack(side=tk.LEFT, padx=4)
+        tk.Button(bar, text="清空", bg=PANEL, fg=TEXT,
+                  font=("微软雅黑", 9), bd=0, padx=10, pady=4,
+                  cursor="hand2", command=_clear_log).pack(side=tk.LEFT, padx=4)
+        tk.Button(bar, text="打开所在文件夹", bg=PANEL, fg=TEXT,
+                  font=("微软雅黑", 9), bd=0, padx=10, pady=4,
+                  cursor="hand2", command=_open_folder).pack(side=tk.LEFT, padx=4)
+
+        tk.Button(bar, text="关闭", bg=PANEL, fg=SUBTEXT,
+                  font=("微软雅黑", 9), bd=0, padx=10, pady=4,
+                  cursor="hand2", command=lw.destroy).pack(side=tk.RIGHT, padx=4)
+
     # ── 截图入口 ─────────────────────────────
     def _cap(self, mode: str):
         # 截图提取文字/翻译时不再隐藏工具条
-        # self.withdraw()  
+        # self.withdraw()
+        _hklog(f"[触发] mode={mode!r}  来源=快捷键或按钮")
         cb_map = {
             "ocr":        self._run_ocr_only,
             "translate":  self._run_ocr_translate,
@@ -916,6 +1102,10 @@ if __name__ == "__main__":
         root.destroy()
         sys.exit(0)
         
+    _hklog("=" * 60, with_kbd_state=False)
+    _hklog(f">>> 程序启动  PID={os.getpid()}  Python={sys.version.split()[0]}")
+    _hklog(f"    HOTKEY_LOG={HOTKEY_LOG}", with_kbd_state=False)
+
     app = CompactBar()
     app.mainloop()
 
