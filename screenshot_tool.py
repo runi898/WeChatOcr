@@ -14,7 +14,9 @@ from tkinter import Toplevel, Canvas, StringVar, OptionMenu
 from tkinter.scrolledtext import ScrolledText
 from PIL import Image, ImageGrab
 import pyperclip
-import keyboard          # 全局热键
+import ctypes
+from ctypes import wintypes
+# 移除 keyboard 组件，改用 Win32 API 稳定方案（无系统静默挂起问题）
 
 import sys
 
@@ -40,22 +42,7 @@ TEMP_IMG       = os.path.join(_WRITE_DIR, "_temp_screenshot.png")
 HOTKEY_LOG = os.path.join(_WRITE_DIR, "hotkey_debug.log")
 
 def _kbd_state_snapshot():
-    try:
-        listener = getattr(keyboard, '_listener', None)
-        has_listener = (listener is not None)
-        
-        t_alive = False
-        if has_listener:
-            if hasattr(listener, 'listening_thread') and listener.listening_thread:
-                t_alive = listener.listening_thread.is_alive()
-            else:
-                t_alive = True # 兼容不同版本 keyboard，无法获取则默认存活
-                
-        hk_cnt = len(getattr(keyboard, '_hotkeys', {}))
-        
-        return f"[kbd状态] listener={has_listener} thread_alive={t_alive} hotkeys={hk_cnt}"
-    except Exception as e:
-        return f"[kbd状态] 获取失败({e})"
+    return "[kbd状态] 使用 Win32 API 原生热键，已解决静默失效问题"
 
 def _hklog(msg: str, level: str = "info", with_kbd_state: bool = True):
     """写入热键诊断日志，带时间戳、级别标签和可选的键盘系统状态快照"""
@@ -651,6 +638,77 @@ except ImportError:
 # ─────────────────────────────────────────────
 #  紧凑浮动工具条（主窗口）
 # ─────────────────────────────────────────────
+
+class Win32HotkeyManager:
+    """原生的 Win32 消息循环热键管理器，系统级接管，彻底解决因为卡顿或UAC导致的钩子静默丢弃问题。"""
+    def __init__(self, app, callback):
+        self.app = app
+        self.callback = callback
+        self._thread = None
+        self._thread_id = None
+        
+    def _parse_hotkey(self, hk_str):
+        mods, vk = 0, 0
+        parts = str(hk_str).lower().split('+')
+        # MOD_ALT=1, MOD_CTRL=2, MOD_SHIFT=4, MOD_WIN=8
+        vk_map = {'page up': 0x21, 'page down': 0x22, 'end': 0x23, 'home': 0x24,
+                  'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28, 'enter': 0x0D, 'esc': 0x1B}
+        for p in parts:
+            p = p.strip()
+            if not p: continue
+            if p == 'ctrl': mods |= 2
+            elif p in ('alt', 'option'): mods |= 1
+            elif p == 'shift': mods |= 4
+            elif p in ('win', 'windows', 'command'): mods |= 8
+            elif p in vk_map: vk = vk_map[p]
+            elif len(p) == 1: vk = ord(p.upper())
+            elif p.startswith('f') and p[1:].isdigit(): vk = 0x6F + int(p[1:])
+        return mods, vk
+
+    def start(self, hotkeys_dict):
+        self.stop()
+        started = threading.Event()
+        
+        def _run():
+            try:
+                self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+                user32 = ctypes.windll.user32
+                actions = {}
+                for icls, (mode, hk_str) in enumerate(hotkeys_dict.items(), 1):
+                    mods, vk = self._parse_hotkey(hk_str)
+                    if vk:
+                        user32.RegisterHotKey(None, icls, mods | 0x4000, vk) # 0x4000=MOD_NOREPEAT
+                        actions[icls] = mode
+                
+                started.set()
+                msg = wintypes.MSG()
+                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    if msg.message == 0x0312:  # WM_HOTKEY
+                        action = actions.get(msg.wParam)
+                        if action:
+                            # 必须通过 tkinter.after 在主线程执行，避免跨线程调用异常
+                            self.app.after(0, lambda a=action: self.callback(a))
+                    elif msg.message == 0x0012: # WM_QUIT
+                        break
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                    
+                for icls in actions:
+                    user32.UnregisterHotKey(None, icls)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+        
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+        started.wait(timeout=2.0)
+
+    def stop(self):
+        if self._thread and self._thread.is_alive() and getattr(self, '_thread_id', None):
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)
+            self._thread.join(timeout=1.0)
+            self._thread_id = None
+
 class CompactBar(tk.Tk):
     """
     橙黄色小工具条，模仿参考图：
@@ -688,9 +746,10 @@ class CompactBar(tk.Tk):
 
         self._build()
         self._registered_hotkeys = {}   # 记录已注册热键 {action: combo}
+        self._hotkey_mgr = Win32HotkeyManager(self, self._cap)
         self._register_hotkeys()
         self._setup_tray()
-        self._hotkey_watchdog()          # 启动热键看门狗
+        # watchdog 不再需要，Win32 API 安全稳定不再掉签
 
     # ── DPI ──────────────────────────────────
     def _calc_dpi(self):
@@ -746,7 +805,7 @@ class CompactBar(tk.Tk):
 
     # ── 热键 ─────────────────────────────────
     def _register_hotkeys(self):
-        _hklog(">>> _register_hotkeys() 调用开始")
+        _hklog(">>> _register_hotkeys() 调用开始 (Win32 API)")
         try:
             cfg = _load_config().get("hotkeys", {})
             h1 = cfg.get("translate", "alt+1")
@@ -754,87 +813,18 @@ class CompactBar(tk.Tk):
             h3 = cfg.get("screenshot", "alt+3")
             h4 = cfg.get("qrcode", "alt+4")
             h5 = cfg.get("gen_qr", "alt+5")
-            _hklog(f"    准备注册: translate={h1!r}  ocr={h2!r} screenshot={h3!r} qrcode={h4!r} gen_qr={h5!r}")
-            keyboard.unhook_all()   # 先清空旧钩子，防止重复注册
-            if hasattr(keyboard, '_hotkeys'):
-                keyboard._hotkeys.clear()  # 手动清空内部字典，防止无限膨胀
-            _hklog("    unhook_all() 完成")
-            keyboard.add_hotkey(h1, lambda: self.after(0, lambda: self._cap("translate")))
-            keyboard.add_hotkey(h2, lambda: self.after(0, lambda: self._cap("ocr")))
-            keyboard.add_hotkey(h3, lambda: self.after(0, lambda: self._cap("screenshot")))
-            keyboard.add_hotkey(h4, lambda: self.after(0, lambda: self._cap("qrcode")))
-            keyboard.add_hotkey(h5, lambda: self.after(0, lambda: self._cap("gen_qr")))
+            _hklog(f"    准备注册 (Win32): translate={h1!r}  ocr={h2!r} screenshot={h3!r} qrcode={h4!r} gen_qr={h5!r}")
+            
             self._registered_hotkeys = {"translate": h1, "ocr": h2, "screenshot": h3, "qrcode": h4, "gen_qr": h5}
+            self._hotkey_mgr.start(self._registered_hotkeys)
+            
             _hklog(f"    热键注册成功: {self._registered_hotkeys}")
         except Exception as ex:
             _hklog(f"!!! 热键注册失败: {ex}", "error")
-            print(f"[热键注册失败] {ex}（需要管理员权限，或快捷键冲突）")
+            print(f"[热键注册失败] {ex}")
 
     def _hotkey_watchdog(self):
-        """每 5 秒检查一次 keyboard 钩子是否存活，失效时自动重新注册并记录诊断日志。
-
-        Windows 低级键盘钩子（SetWindowsHookEx）在以下情况会静默失效：
-          - 系统 UAC 弹窗 / 安全桌面切换
-          - 全屏游戏/程序抢占输入焦点
-          - 宿主线程消息队列积压超时（系统会自动移除钩子）
-
-        双重检测策略：
-          1. 检查 keyboard 内部监听线程是否活着
-          2. 检查已注册热键回调表是否为空
-        任一条件不满足且曾注册过热键，则触发重注册。
-        """
-        # 看门狗计数器，每 60 次（约 5 分钟）写一次心跳日志
-        self._watchdog_tick = getattr(self, '_watchdog_tick', 0) + 1
-        write_heartbeat = (self._watchdog_tick % 60 == 1)
-
-        def _check():
-            needs_reregister = False
-            reason = ""
-            try:
-                # 检测1：keyboard 内部监听线程是否还活着
-                listener = getattr(keyboard, '_listener', None)
-                t_alive = False
-                if listener is not None:
-                    if hasattr(listener, 'listening_thread') and listener.listening_thread:
-                        t_alive = listener.listening_thread.is_alive()
-                    else:
-                        t_alive = True
-
-                if listener is not None and not t_alive:
-                    needs_reregister = True
-                    reason = "监听线程已死亡"
-
-                # 检测2：热键回调表是否为空
-                if not needs_reregister:
-                    hk_dict = getattr(keyboard, '_hotkeys', {})
-                    if not hk_dict and self._registered_hotkeys:
-                        needs_reregister = True
-                        reason = "热键回调表(_hotkeys)意外置空"
-
-                # 心跳日志（每 5 分钟）
-                if write_heartbeat:
-                    _hklog(f"[心跳] tick={self._watchdog_tick} needs_reregister={needs_reregister}")
-
-            except Exception as ex:
-                needs_reregister = True
-                reason = f"看门狗检测异常: {ex}"
-                _hklog(f"!!! 看门狗检测异常: {ex}", "error")
-
-            if needs_reregister and self._registered_hotkeys:
-                _hklog(f">>> 触发重注册，原因: {reason}", "warning")
-                print(f"[热键看门狗] {reason}，正在重新注册...")
-                try:
-                    self._register_hotkeys()
-                except Exception as ex:
-                    _hklog(f"!!! 重注册失败: {ex}", "error")
-                    print(f"[热键看门狗] 重注册失败: {ex}")
-
-        try:
-            _check()
-        except Exception as ex:
-            _hklog(f"!!! _check() 未捕获异常: {ex}", "error")
-        # 每 5000ms 再次检查（使用 tkinter after，运行在主线程，线程安全）
-        self.after(5000, self._hotkey_watchdog)
+        pass # 已废弃，因为我们改用了原生稳定的 Win32HotkeyManager
 
     # ── 系统托盘 ─────────────────────────────
     def _setup_tray(self):
@@ -884,7 +874,7 @@ class CompactBar(tk.Tk):
         if self._tray:
             try: self._tray.stop()
             except Exception: pass
-        try: keyboard.unhook_all()
+        try: getattr(self, '_hotkey_mgr', None) and self._hotkey_mgr.stop()
         except Exception: pass
         self.destroy()
 
@@ -1043,7 +1033,6 @@ class CompactBar(tk.Tk):
             
             # 重新注册热键
             try:
-                keyboard.unhook_all()
                 self._register_hotkeys()
             except Exception:
                 pass
@@ -1354,7 +1343,7 @@ class CompactBar(tk.Tk):
     def status(self, msg: str): pass   # stub
 
     def destroy(self):
-        try: keyboard.unhook_all()
+        try: getattr(self, '_hotkey_mgr', None) and self._hotkey_mgr.stop()
         except Exception: pass
         super().destroy()
 

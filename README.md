@@ -37,4 +37,15 @@ C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp
 - **如何退出？**
   - 此程序采用静默守护，您可以随时到右下角“系统托盘区”找到有“wxocr”字样的图标，右键点击“退出”即可。
 
+## 📦 二维码功能底层依赖
+
+本项目中的二维码功能分别调用了以下开源库和模块：
+
+1. **二维码查知识别 (扫码)**：
+   - 依赖于 **`opencv-contrib-python`** 库。
+   - 底层调用了开源的微信二维码引擎：`cv2.wechat_qrcode_WeChatQRCode()`。这是 Tencent 官方开源并在 OpenCV Contrib 中提供的基于 CNN（卷积神经网络）的超强解析模型，即使残缺、模糊或极端视角依然能精准识别。
+2. **二维码生成**：
+   - 依赖于 Python 著名的 **`qrcode`** 库，以及用于配合生成和处理图像的 **`Pillow`** (PIL) 库。
+   - 调用原生的 `qrcode.QRCode()` 接口来轻松生成二维码图片数据，并可以通过图形界面展示及保存。
+
 
