@@ -83,6 +83,23 @@ BTN_FG  = "#ffffff"
 # ─────────────────────────────────────────────
 #  OCR 核心
 # ─────────────────────────────────────────────
+
+# 修复：wcocr.init 只能调用一次，每次重新启动 WeChatOCR.exe
+# 子进程在 Win10 Defender 或杀毒软件扫描下可能阻塞数秒乃至更久，
+# 从而卡死 OCR worker 线程（表现：截图后程序假死/转圈）。
+# 改为全局只初始化一次，之后所有调用复用同一进程通道。
+_wcocr_initialized = False
+_wcocr_init_lock   = threading.Lock()
+
+def _ensure_wcocr_init():
+    global _wcocr_initialized
+    if _wcocr_initialized:
+        return
+    with _wcocr_init_lock:
+        if not _wcocr_initialized:  # double-check
+            wcocr.init(WECHATOCR_EXE, WECHAT_LIB_DIR)
+            _wcocr_initialized = True
+
 def do_ocr(image_path: str) -> str:
     res = do_ocr_raw(image_path)
     if isinstance(res, str):
@@ -93,7 +110,7 @@ def do_ocr(image_path: str) -> str:
 def do_ocr_raw(image_path: str):
     """返回原始结果: [{'text': 'abc', 'left': x, 'top': y, 'right': x, 'bottom': y}, ...]"""
     try:
-        wcocr.init(WECHATOCR_EXE, WECHAT_LIB_DIR)
+        _ensure_wcocr_init()
         result = wcocr.ocr(image_path)
         items = []
         for item in result.get("ocr_response", []):
@@ -373,13 +390,15 @@ def grab_region(app, callback, mode_name=""):
             )
 
             # 延迟 150ms 确保遮罩消失后再截图
+            # 修复：callback 必须在主线程（tkinter 要求），
+            # 子线程只负责截图 I/O，完成后通过 app.after() 调度回主线程执行 callback。
             def _do_grab():
                 import time
                 time.sleep(0.15)
                 img = ImageGrab.grab(bbox=bbox, all_screens=True)
                 img.save(TEMP_IMG)
-                # 传入逻辑坐标给 callback
-                callback(TEMP_IMG, lx1, ly1, lx2, ly2)
+                # 回到主线程再调用 callback，彻底避免跨线程 tkinter 操作
+                app.after(0, lambda: callback(TEMP_IMG, lx1, ly1, lx2, ly2))
 
             threading.Thread(target=_do_grab, daemon=True).start()
 
@@ -557,7 +576,12 @@ class InPlaceOverlay(Toplevel):
                         lbl.place(x=x_pos, y=y_pos)
                         self._trans_labels.append(lbl)
                         
-                        lbl.update_idletasks()
+                        # 修复：update_idletasks 必须在主线程调用，
+                        # 用 winfo_reqheight/width 前先安全地刷新布局
+                        try:
+                            lbl.update_idletasks()
+                        except Exception:
+                            pass
                         l_reqh = lbl.winfo_reqheight()
                         
                         max_bottom = max(max_bottom, y_pos + l_reqh)
