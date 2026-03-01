@@ -298,22 +298,23 @@ def do_translate(text: str, target_lang: str, engine: str = "腾讯翻译") -> s
     return "（已收到识别结果直接展示）\n\n[翻译失败：所有免费接口（百度/有道/MyMemory）均不可达或被频率限制，请稍微检查网络后再试]"
 
 # ─────────────────────────────────────────────
-#  截图选区（tkinter 全屏遮罩）
+#  截图选区（微信风格：截图背景 + 框选区域亮显）
 # ─────────────────────────────────────────────
 def grab_region(app, callback, mode_name=""):
-    """在主线程中打开截图遮罩，完成后调用 callback(image_path)
-    支持多显示器：遮罩覆盖全部屏幕（含副屏/负坐标显示器）
-    支持右键或 ESC 取消截图
+    """在主线程中打开截图遮罩，完成后调用 callback(image_path, lx1,ly1,lx2,ly2, crop_img)
+    - 全屏半透明遮罩，框选区域亮显原始屏幕内容（微信同款效果）
+    - 支持多显示器（含副屏/负坐标）
+    - 右键或 ESC 取消
     """
+    from PIL import ImageTk, ImageDraw
 
     def _open():
-        # ── 获取虚拟屏幕范围（所有显示器合并后的总区域）──────
+        # ── 获取虚拟屏幕范围 ──────────────────────
         try:
-            import ctypes
-            SM_XVIRTUALSCREEN  = 76   # 虚拟屏幕左边界（副屏在左时为负）
-            SM_YVIRTUALSCREEN  = 77   # 虚拟屏幕上边界（副屏在上时为负）
-            SM_CXVIRTUALSCREEN = 78   # 虚拟屏幕总宽度
-            SM_CYVIRTUALSCREEN = 79   # 虚拟屏幕总高度
+            SM_XVIRTUALSCREEN  = 76
+            SM_YVIRTUALSCREEN  = 77
+            SM_CXVIRTUALSCREEN = 78
+            SM_CYVIRTUALSCREEN = 79
             u32 = ctypes.windll.user32
             vx  = u32.GetSystemMetrics(SM_XVIRTUALSCREEN)
             vy  = u32.GetSystemMetrics(SM_YVIRTUALSCREEN)
@@ -324,10 +325,32 @@ def grab_region(app, callback, mode_name=""):
             vw = app.winfo_screenwidth()
             vh = app.winfo_screenheight()
 
+        dpi_sx, dpi_sy = app._dpi_scale
+
+        # ── 1. 弹出遮罩前先抓全屏（物理像素）──────
+        try:
+            sc_bbox = (
+                int(vx * dpi_sx), int(vy * dpi_sy),
+                int((vx + vw) * dpi_sx), int((vy + vh) * dpi_sy),
+            )
+            full_img = ImageGrab.grab(bbox=sc_bbox, all_screens=True)
+            # 缩放到 Canvas 逻辑尺寸（避免高分屏内存占用过大）
+            full_canvas = full_img.resize((vw, vh), Image.BILINEAR)
+        except Exception:
+            full_img = None
+            full_canvas = None
+
+        # 预生成基础暗色遮罩图（60% 黑色混合）
+        if full_canvas:
+            dark_overlay = Image.new("RGB", (vw, vh), (0, 0, 0))
+            dim_base = Image.blend(full_canvas, dark_overlay, 0.62)
+        else:
+            dim_base = Image.new("RGB", (vw, vh), (0, 0, 40))
+
+        # ── 2. 创建透明度=1 的遮罩窗口 ────────────
         overlay = Toplevel(app)
-        overlay.overrideredirect(True)                    # 无边框
-        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")         # 覆盖全部显示器
-        overlay.attributes("-alpha",   0.25)
+        overlay.overrideredirect(True)
+        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")
         overlay.attributes("-topmost", True)
         overlay.configure(bg="black")
         overlay.lift()
@@ -337,68 +360,103 @@ def grab_region(app, callback, mode_name=""):
                         highlightthickness=0, width=vw, height=vh)
         canvas.pack(fill=tk.BOTH, expand=True)
 
-        # 提示文字（显示在虚拟屏幕中心）
+        # 存储 PhotoImage 引用（防止被 GC 回收）
+        _ref = {"photo": None, "pending": False}
+
+        def _update_canvas(pil_img):
+            photo = ImageTk.PhotoImage(pil_img)
+            canvas.delete("bg")
+            canvas.create_image(0, 0, anchor="nw", image=photo, tags="bg")
+            canvas.tag_lower("bg")         # 图置底
+            _ref["photo"] = photo
+
+        _update_canvas(dim_base)
+
+        # 提示文字
         hint_str = "拖动鼠标框选区域"
         if mode_name:
             hint_str = f"[{mode_name}] " + hint_str
         hint_str += "  ·  右键 或 ESC 取消"
-        
-        canvas.create_text(
-            vw // 2, vh // 2,
-            text=hint_str,
-            fill="#ffffff", font=("微软雅黑", 18), tags="hint"
-        )
+        canvas.create_text(vw // 2, vh // 2, text=hint_str,
+                           fill="#ffffff", font=("微软雅黑", 18), tags="hint")
 
-        state = {"sx": 0, "sy": 0, "rect": None}
+        state = {"sx": 0, "sy": 0}
 
         def on_press(e):
             state["sx"], state["sy"] = e.x_root, e.y_root
-            canvas.delete("hint")           # 按下后隐藏提示
+            canvas.delete("hint")
+
+        def _redraw(cx1, cy1, cx2, cy2):
+            """合成：选区内亮，其余暗；更新 Canvas"""
+            if full_canvas:
+                composite = dim_base.copy()
+                # 把选区区域贴回原始亮图
+                bx1, by1 = max(0, int(cx1)), max(0, int(cy1))
+                bx2, by2 = min(vw, int(cx2)), min(vh, int(cy2))
+                if bx2 > bx1 and by2 > by1:
+                    patch = full_canvas.crop((bx1, by1, bx2, by2))
+                    composite.paste(patch, (bx1, by1))
+                _update_canvas(composite)
+            # 重绘绿色选框（置顶）
+            canvas.delete("sel_rect")
+            canvas.create_rectangle(
+                int(cx1), int(cy1), int(cx2), int(cy2),
+                outline="#22cc44", width=2, tags="sel_rect"
+            )
+            canvas.tag_raise("sel_rect")
+            _ref["pending"] = False
 
         def on_drag(e):
-            if state["rect"]:
-                canvas.delete(state["rect"])
-            # e.x_root/y_root 是绝对屏幕坐标，转为 canvas 内坐标
-            rx = state["sx"] - canvas.winfo_rootx()
-            ry = state["sy"] - canvas.winfo_rooty()
-            state["rect"] = canvas.create_rectangle(
-                rx, ry,
-                e.x_root - canvas.winfo_rootx(),
-                e.y_root - canvas.winfo_rooty(),
-                outline="#22cc44", width=2
-            )
+            if _ref["pending"]:
+                return  # 节流：等上一帧完成
+            x1, y1 = state["sx"], state["sy"]
+            x2, y2 = e.x_root, e.y_root
+            cx1 = min(x1, x2) - vx
+            cy1 = min(y1, y2) - vy
+            cx2 = max(x1, x2) - vx
+            cy2 = max(y1, y2) - vy
+            if cx2 - cx1 < 3 or cy2 - cy1 < 3:
+                return
+            _ref["pending"] = True
+            overlay.after(20, lambda a=cx1,b=cy1,c=cx2,d=cy2: _redraw(a, b, c, d))
 
         def on_release(e):
             x1, y1 = state["sx"], state["sy"]
             x2, y2 = e.x_root, e.y_root
             overlay.destroy()
-            overlay.update()
 
-            if abs(x2 - x1) < 5 or abs(y2 - y1) < 5:
-                app.after(0, lambda: app.status("框选区域太小，已取消"))
-                return
-
-            # 逻辑坐标（用于弹窗位置，可能包含<0的副屏坐标）
             lx1, ly1 = int(min(x1, x2)), int(min(y1, y2))
             lx2, ly2 = int(max(x1, x2)), int(max(y1, y2))
 
-            # DPI 缩放 → 物理像素（用于截图，all_screens=True 支持负坐标）
-            sx, sy = app._dpi_scale
-            bbox = (
-                int(lx1 * sx), int(ly1 * sy),
-                int(lx2 * sx), int(ly2 * sy),
-            )
+            if abs(lx2 - lx1) < 5 or abs(ly2 - ly1) < 5:
+                app.after(0, lambda: app.status("框选区域太小，已取消"))
+                return
 
-            # 延迟 150ms 确保遮罩消失后再截图
-            # 修复：callback 必须在主线程（tkinter 要求），
-            # 子线程只负责截图 I/O，完成后通过 app.after() 调度回主线程执行 callback。
+            # 从预抓截图裁切选区（转为物理像素在 full_img 中裁切）
             def _do_grab():
-                import time
-                time.sleep(0.15)
-                img = ImageGrab.grab(bbox=bbox, all_screens=True)
-                img.save(TEMP_IMG)
-                # 回到主线程再调用 callback，彻底避免跨线程 tkinter 操作
-                app.after(0, lambda: callback(TEMP_IMG, lx1, ly1, lx2, ly2))
+                nonlocal full_img
+                if full_img:
+                    # canvas 坐标 → full_img 物理像素坐标
+                    fx1 = int((lx1 - vx) * dpi_sx)
+                    fy1 = int((ly1 - vy) * dpi_sy)
+                    fx2 = int((lx2 - vx) * dpi_sx)
+                    fy2 = int((ly2 - vy) * dpi_sy)
+                    fx1 = max(0, min(fx1, full_img.width))
+                    fy1 = max(0, min(fy1, full_img.height))
+                    fx2 = max(0, min(fx2, full_img.width))
+                    fy2 = max(0, min(fy2, full_img.height))
+                    crop_img = full_img.crop((fx1, fy1, fx2, fy2))
+                    crop_img.save(TEMP_IMG)
+                else:
+                    import time
+                    time.sleep(0.15)
+                    bbox = (
+                        int(lx1 * dpi_sx), int(ly1 * dpi_sy),
+                        int(lx2 * dpi_sx), int(ly2 * dpi_sy),
+                    )
+                    crop_img = ImageGrab.grab(bbox=bbox, all_screens=True)
+                    crop_img.save(TEMP_IMG)
+                app.after(0, lambda: callback(TEMP_IMG, lx1, ly1, lx2, ly2, crop_img))
 
             threading.Thread(target=_do_grab, daemon=True).start()
 
@@ -407,51 +465,51 @@ def grab_region(app, callback, mode_name=""):
             app.status("已取消截图")
             return "break"
 
-        def _rclick_press(e):
-            return "break"   # 消耗右键按下事件，防止弹出底层的系统菜单
-
-        def _rclick_release(e):
-            return _cancel()
+        def _rclick_press(e):   return "break"
+        def _rclick_release(e): return _cancel()
 
         canvas.bind("<ButtonPress-1>",   on_press)
         canvas.bind("<B1-Motion>",       on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
-        
-        # 右键退出绑定（必须同时吸收 Press 和 Release，避免底层冒泡）
         canvas.bind("<ButtonPress-3>",   _rclick_press)
         canvas.bind("<ButtonRelease-3>", _rclick_release)
         overlay.bind("<ButtonPress-3>",  _rclick_press)
         overlay.bind("<ButtonRelease-3>",_rclick_release)
-        
         overlay.bind("<Escape>", _cancel)
 
-    app.after(0, _open)      # 必须在主线程调用 tkinter
+    app.after(0, _open)
+
 
 
 # ─────────────────────────────────────────────
-#  原位覆盖结果层（与微信截屏翻译效果相同）
+#  原位覆盖结果层（微信同款：截图原图为背景，译文原位渲染）
 # ─────────────────────────────────────────────
 class InPlaceOverlay(Toplevel):
     """
     微信原生截图翻译效果：
-    白色背景 + 绿色边框 + 译文直接覆盖选区 + 下方工具栏
+    - 以截图原图作 Canvas 背景，背景/中文/图标等一概不变
+    - 仅在 OCR 文字坐标处直接渲染译文（无任何底色块）
+    - 字体颜色从截图对应区域自动采样
     ❗ 必须在主线程中创建！
     """
 
-    def __init__(self, parent, lx1: int, ly1: int, lx2: int, ly2: int, mode: str):
+    def __init__(self, parent, lx1: int, ly1: int, lx2: int, ly2: int,
+                 mode: str, bg_img=None, dpi_scale=(1.0, 1.0)):
         super().__init__(parent)
         self.overrideredirect(True)
         self.attributes("-topmost", True)
-        # 白色背景 + 绿色边框（与微信完全一致）
-        self.configure(bg="white",
+        self.configure(bg="black",
                        highlightthickness=2,
                        highlightbackground="#22cc44")
-        self._mode    = mode
-        self._ocr_txt = ""
-        self._tr_txt  = ""
-        self._parent  = parent
-        self._toolbar = None
-        self._trans_labels = []
+        self._mode      = mode
+        self._ocr_txt   = ""
+        self._tr_txt    = ""
+        self._parent    = parent
+        self._toolbar   = None
+        self._text_ids  = []
+        self._bg_img    = bg_img
+        self._dpi_scale = dpi_scale
+        self._photo_ref = None
 
         sw = parent.winfo_screenwidth()
         sh = parent.winfo_screenheight()
@@ -459,27 +517,137 @@ class InPlaceOverlay(Toplevel):
         h  = max(ly2 - ly1, 40)
         self._px = max(0, min(lx1, sw - w))
         self._py = max(0, min(ly1, sh - h))
-        self._win_w, self._win_h = w, h         # 注意：不能用 self._w，那是 tkinter 内部属性
+        self._win_w, self._win_h = w, h
         self.geometry(f"{w}x{h}+{self._px}+{self._py}")
 
-        # 内容标签：白底黑字，直接显示译文（与微信一致）
-        init = "翻译中…" if mode == "translate" else "识别中…"
-        self._text_var = tk.StringVar(value=init)
-        self._lbl = tk.Label(
-            self, textvariable=self._text_var,
+        self._canvas = Canvas(self, bg="black", highlightthickness=0,
+                              width=w, height=h)
+        self._canvas.pack(fill=tk.BOTH, expand=True)
+
+        if bg_img:
+            self._render_bg(bg_img, w, h)
+            if mode == "translate":
+                self._canvas.create_text(
+                    w // 2, h // 2, text="翻译中\u2026",
+                    fill="#ffffff", font=("微软雅黑", 13), tags="loading"
+                )
+        else:
+            self._canvas.configure(bg="white")
+            self._canvas.create_text(
+                w // 2, h // 2,
+                text="翻译中\u2026" if mode == "translate" else "识别中\u2026",
+                fill="#111111", font=("微软雅黑", 11), tags="loading"
+            )
+
+        self._fallback_var = tk.StringVar(value="")
+        self._fallback_lbl = tk.Label(
+            self, textvariable=self._fallback_var,
             bg="white", fg="#111111",
-            font=("微软雅黑", 11),
-            wraplength=w - 16,
-            justify=tk.LEFT, anchor="nw",
-            padx=8, pady=6
+            font=("微软雅黑", 11), wraplength=w - 16,
+            justify=tk.LEFT, anchor="nw", padx=8, pady=6
         )
-        self._lbl.pack(fill=tk.BOTH, expand=True)
+
         self._build_toolbar(sh)
-        # 创建后立即抓取焦点，这样 ESC 无需先点击即可生效
         self.focus_force()
 
-    def _build_toolbar(self, sh: int):
-        """在选区正下方创建微信风格小工具栏"""
+    def _render_bg(self, pil_img, w, h):
+        from PIL import ImageTk
+        try:
+            display = pil_img.resize((w, h), Image.BILINEAR)
+            photo = ImageTk.PhotoImage(display)
+            self._canvas.delete("bg_img")
+            self._canvas.create_image(0, 0, anchor="nw", image=photo, tags="bg_img")
+            self._canvas.tag_lower("bg_img")
+            self._photo_ref = photo
+        except Exception:
+            pass
+
+    def _erase_text_regions(self, pil_img, items):
+        """
+        把 OCR 识别到的每个文字区域用周边背景色填充，
+        彻底抹去原文像素，避免翻译文字与原文叠加错乱。
+        返回处理后的新 PIL Image（不修改原图）。
+        """
+        from PIL import ImageDraw
+        img  = pil_img.copy().convert("RGB")
+        draw = ImageDraw.Draw(img)
+        iw, ih = img.size
+        BORDER = 4          # 向外采样这么多像素作为背景色
+
+        for item in items:
+            x1 = max(0, int(item.get("left",  0)))
+            y1 = max(0, int(item.get("top",   0)))
+            x2 = min(iw, int(item.get("right", 0)))
+            y2 = min(ih, int(item.get("bottom",0)))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            # 采样四条边外侧的像素作为背景色估计
+            border_pixels = []
+            # 上边
+            for bx in range(max(0, x1 - BORDER), min(iw, x2 + BORDER)):
+                for by in range(max(0, y1 - BORDER), y1):
+                    border_pixels.append(img.getpixel((bx, by))[:3])
+            # 下边
+            for bx in range(max(0, x1 - BORDER), min(iw, x2 + BORDER)):
+                for by in range(y2, min(ih, y2 + BORDER)):
+                    border_pixels.append(img.getpixel((bx, by))[:3])
+            # 左边
+            for bx in range(max(0, x1 - BORDER), x1):
+                for by in range(y1, y2):
+                    border_pixels.append(img.getpixel((bx, by))[:3])
+            # 右边
+            for bx in range(x2, min(iw, x2 + BORDER)):
+                for by in range(y1, y2):
+                    border_pixels.append(img.getpixel((bx, by))[:3])
+
+            if border_pixels:
+                r = sum(p[0] for p in border_pixels) // len(border_pixels)
+                g = sum(p[1] for p in border_pixels) // len(border_pixels)
+                b = sum(p[2] for p in border_pixels) // len(border_pixels)
+                fill = (r, g, b)
+            else:
+                fill = (240, 240, 240)
+
+            # 填充文字区域（稍微向外扩 1px 覆盖边缘）
+            draw.rectangle(
+                [max(0, x1 - 1), max(0, y1 - 1),
+                 min(iw, x2 + 1), min(ih, y2 + 1)],
+                fill=fill
+            )
+        return img
+
+    def _sample_text_color(self, x1, y1, x2, y2):
+        if not self._bg_img:
+            return "#ffffff"
+        try:
+            iw, ih = self._bg_img.size
+            rx1, ry1 = max(0, x1), max(0, y1)
+            rx2, ry2 = min(iw, x2), min(ih, y2)
+            if rx2 <= rx1 or ry2 <= ry1:
+                return "#ffffff"
+            region = self._bg_img.crop((rx1, ry1, rx2, ry2)).convert("RGB")
+            pixels = list(region.getdata())
+            if not pixels:
+                return "#ffffff"
+            brightnesses = [(r * 299 + g * 587 + b * 114) // 1000 for r, g, b in pixels]
+            avg_br = sum(brightnesses) // len(brightnesses)
+            if avg_br > 128:
+                cands = [pixels[i] for i, b in enumerate(brightnesses) if b < avg_br - 30]
+                if not cands:
+                    return "#111111"
+            else:
+                cands = [pixels[i] for i, b in enumerate(brightnesses) if b > avg_br + 30]
+                if not cands:
+                    return "#ffffff"
+            r = sum(p[0] for p in cands) // len(cands)
+            g = sum(p[1] for p in cands) // len(cands)
+            b = sum(p[2] for p in cands) // len(cands)
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            return "#ffffff"
+
+    def _build_toolbar(self, sh):
         tb = Toplevel(self._parent)
         tb.overrideredirect(True)
         tb.attributes("-topmost", True)
@@ -493,14 +661,13 @@ class InPlaceOverlay(Toplevel):
         tb.geometry(f"{TW}x{TH}+{tx}+{ty}")
         bar = tk.Frame(tb, bg="#2b2b2b")
         bar.pack(fill=tk.BOTH, expand=True, padx=4, pady=3)
-        self._tbtn(bar, "📋 复制", self._do_copy).pack(side=tk.LEFT, padx=4)
+        self._tbtn(bar, "\U0001f4cb 复制", self._do_copy).pack(side=tk.LEFT, padx=4)
         if self._mode == "translate":
             self._tbtn(bar, "原文", self._show_ocr).pack(side=tk.LEFT, padx=2)
-        self._tbtn(bar, "×", self._close_all,
+        self._tbtn(bar, "\xd7", self._close_all,
                    fg="#ff5555", bg="#3d2222").pack(side=tk.RIGHT, padx=4)
-        self._tbtn(bar, "✓", self._close_all,
+        self._tbtn(bar, "\u2713", self._close_all,
                    fg="#44dd44", bg="#1e3323").pack(side=tk.RIGHT, padx=2)
-        # ESC 关闭翻译窗
         self.bind("<Escape>", lambda e: self._close_all())
         tb.bind("<Escape>", lambda e: self._close_all())
 
@@ -514,124 +681,78 @@ class InPlaceOverlay(Toplevel):
     def set_ocr(self, text: str):
         self._ocr_txt = text
         if self._mode == "ocr":
-            self._text_var.set(text)
+            self._canvas.delete("loading")
+            self._canvas.create_text(
+                8, 8, text=text, fill="#111111",
+                font=("微软雅黑", 11), anchor="nw",
+                width=self._win_w - 16, tags="ocr_text"
+            )
 
     def set_trans(self, text: str, items=None):
         self._tr_txt = text
-        if self._mode == "translate":
-            self._lbl.config(fg="#111111")
-            
-            # 清理旧的独立标签
-            for lbl in self._trans_labels:
-                lbl.destroy()
-            self._trans_labels.clear()
-            
-            # 基础宽高
-            w = self.winfo_width()
-            sw = self.winfo_screenwidth()
-            
-            # ========================
-            # 多排版智能渲染（如果有坐标+行数对应）
-            # ========================
-            if items:
-                # 把原文和翻译结果按行拆分进行数量比对
-                translated_lines = [l.strip() for l in text.split("\n") if l.strip()]
-                original_lines = [item for item in items if item.get("text", "").strip()]
-                
-                if len(translated_lines) == len(original_lines) and len(original_lines) > 0:
-                    # ✅ 美好情况：翻译结果的行数和原文一致！完美执行原位覆盖！
-                    # 我们先把原本用于显示大段落的大 Label 隐藏掉：
-                    self._text_var.set("")
-                    self._lbl.config(wraplength=0) # 禁用
-                    
-                    # 为了确定新窗口大小，追踪最底部的文字边界
-                    max_bottom = 0
-                    min_left = sw
-                    max_right = 0
-                    
-                    for idx, item in enumerate(original_lines):
-                        t_txt = translated_lines[idx]
-                        
-                        # 解析原本的坐标
-                        left = int(item["left"])
-                        top = int(item["top"])
-                        right = int(item["right"])
-                        bot = int(item["bottom"])
-                        
-                        # 行高和最大宽度
-                        row_h = bot - top
-                        row_w = max(50, right - left) # 宽度给足一点
-                        
-                        # 为了避免完全遮挡原来图片的间隙，给个细微修正
-                        lbl = tk.Label(self, text=t_txt,
-                                     bg="#eef2f5", fg="#111111", 
-                                     font=("微软雅黑", max(9, min(14, int(row_h * 0.7)))),
-                                     justify=tk.LEFT, anchor="nw", 
-                                     wraplength=row_w + 100)
-                        
-                        # 覆盖在原图片的准确位置上，向外拓宽一点点视觉效果更好
-                        x_pos = max(0, left - 4)
-                        y_pos = max(0, top - 2)
-                        
-                        lbl.place(x=x_pos, y=y_pos)
-                        self._trans_labels.append(lbl)
-                        
-                        # 修复：update_idletasks 必须在主线程调用，
-                        # 用 winfo_reqheight/width 前先安全地刷新布局
-                        try:
-                            lbl.update_idletasks()
-                        except Exception:
-                            pass
-                        l_reqh = lbl.winfo_reqheight()
-                        
-                        max_bottom = max(max_bottom, y_pos + l_reqh)
-                        min_left = min(min_left, x_pos)
-                        max_right = max(max_right, x_pos + lbl.winfo_reqwidth())
-                        
-                    req_h = max_bottom + 16
-                    new_w = max(w, max_right - min_left + 10)
-                else:
-                    # ❌ 糟糕情况：遇到大长句，翻译引擎把它合并成了1段或重新分段了。
-                    # 回退到我们以前的中心展示模式
-                    self._text_var.set(text)
-                    self._lbl.config(wraplength=max(200, w - 20))
-                    self.update_idletasks()
-                    req_h = self._lbl.winfo_reqheight() + 16
-                    new_w = w
-            else:
-                self._text_var.set(text)
-                self._lbl.config(wraplength=max(200, w - 20))
-                self.update_idletasks()
-                req_h = self._lbl.winfo_reqheight() + 16
-                new_w = w
+        if self._mode != "translate":
+            return
 
-            new_h = max(self._win_h, req_h)
-            new_w = max(new_w, self.winfo_width())
-            
-            x = self.winfo_x()
-            y = self.winfo_y()
-            if x + new_w > sw - 10:
-                x = max(10, sw - new_w - 10)
-            
-            self.geometry(f"{new_w}x{new_h}+{x}+{y}")
-            self._win_h = new_h
-            
-            if getattr(self, "_toolbar", None):
-                tb_w, tb_h = 240, 34
-                tx = x + (new_w - tb_w) // 2
-                ty = y + new_h + 3
-                if ty + tb_h > self.winfo_screenheight() - 10:
-                    ty = y - tb_h - 3
-                self._toolbar.geometry(f"{tb_w}x{tb_h}+{tx}+{ty}")
+        self._canvas.delete("loading")
+        for tid in self._text_ids:
+            self._canvas.delete(tid)
+        self._text_ids.clear()
+        self._fallback_lbl.place_forget()
+
+        dpi_sx, dpi_sy = self._dpi_scale
+        w = self._win_w
+        h = self._win_h
+
+        translated_lines = [l.strip() for l in text.split("\n") if l.strip()]
+        original_lines   = [it for it in (items or []) if it.get("text", "").strip()]
+
+        if original_lines and len(translated_lines) == len(original_lines):
+            # ── 先抹掉背景图中的原文像素，再渲染，避免叠字 ────
+            if self._bg_img:
+                erased = self._erase_text_regions(self._bg_img, original_lines)
+                self._render_bg(erased, w, h)
+
+            for idx, item in enumerate(original_lines):
+                t_txt = translated_lines[idx]
+                px1, py1 = int(item["left"]),  int(item["top"])
+                px2, py2 = int(item["right"]), int(item["bottom"])
+                cx  = int(px1 / dpi_sx)
+                cy  = int(py1 / dpi_sy)
+                row_h_px = py2 - py1
+                font_pt  = max(8, min(18, int(row_h_px / dpi_sy * 0.85)))
+                fg_color = self._sample_text_color(px1, py1, px2, py2)
+                tid = self._canvas.create_text(
+                    cx, cy, text=t_txt,
+                    fill=fg_color,
+                    font=("微软雅黑", font_pt),
+                    anchor="nw", tags="trans_text"
+                )
+                self._text_ids.append(tid)
+        else:
+            if self._bg_img:
+                self._render_bg(self._bg_img, w, h)
+            self._fallback_var.set(text)
+            self._fallback_lbl.configure(wraplength=w - 16)
+            self._fallback_lbl.place(x=0, y=0, width=w)
 
     def _show_ocr(self):
-        if self._ocr_txt:
-            self._text_var.set(self._ocr_txt)
-            self._lbl.config(fg="#666688")
+        for tid in self._text_ids:
+            self._canvas.delete(tid)
+        self._text_ids.clear()
+        self._canvas.delete("loading")
+        self._fallback_lbl.place_forget()
+        if self._bg_img:
+            self._render_bg(self._bg_img, self._win_w, self._win_h)
+        self._canvas.create_text(
+            8, 8, text=self._ocr_txt,
+            fill="#ccccff", font=("微软雅黑", 11),
+            anchor="nw", width=self._win_w - 16, tags="ocr_text"
+        )
 
     def _do_copy(self):
         t = self._tr_txt or self._ocr_txt
-        if t: pyperclip.copy(t)
+        if t:
+            pyperclip.copy(t)
 
     def _close_all(self):
         for w in (self._toolbar, self):
@@ -648,6 +769,7 @@ class InPlaceOverlay(Toplevel):
         except Exception:
             pass
         super().destroy()
+
 
 
 
@@ -1164,7 +1286,7 @@ class CompactBar(tk.Tk):
             self.after(200, lambda: grab_region(self, action, mode_name=m_name))
 
     # ── 提取文字（OCR 复制）────────────────
-    def _run_ocr_only(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
+    def _run_ocr_only(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300, crop_img=None):
         def _main():
             def worker():
                 text = do_ocr(img_path)
@@ -1177,7 +1299,7 @@ class CompactBar(tk.Tk):
         self.after(0, _main)
 
     # ── 截图到剪贴板 ─────────────────────────
-    def _run_screenshot(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
+    def _run_screenshot(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300, crop_img=None):
         import subprocess
         def _main():
             try:
@@ -1192,11 +1314,12 @@ class CompactBar(tk.Tk):
         self.after(0, _main)
 
     # ── OCR + 翻译 ───────────────────────────
-    def _run_ocr_translate(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
+    def _run_ocr_translate(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300, crop_img=None):
         def _main():
             engine = self.engine_var.get()
             lang   = self.lang_var.get()
-            popup  = InPlaceOverlay(self, lx1, ly1, lx2, ly2, mode="translate")
+            popup  = InPlaceOverlay(self, lx1, ly1, lx2, ly2, mode="translate",
+                                    bg_img=crop_img, dpi_scale=self._dpi_scale)
 
             def worker():
                 # 使用 raw 返回来保留左、右、上、下的真实坐标点阵
@@ -1227,7 +1350,7 @@ class CompactBar(tk.Tk):
         self.after(0, _main)
 
     # ── 扫码（微信 OpenCV QR） ────────────────
-    def _run_qrcode(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
+    def _run_qrcode(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300, crop_img=None):
         def _main():
             def worker():
                 try:
