@@ -14,9 +14,7 @@ from tkinter import Toplevel, Canvas, StringVar, OptionMenu
 from tkinter.scrolledtext import ScrolledText
 from PIL import Image, ImageGrab
 import pyperclip
-import ctypes
-from ctypes import wintypes
-# 移除 keyboard 组件，改用 Win32 API 稳定方案（无系统静默挂起问题）
+import keyboard          # 全局热键
 
 import sys
 
@@ -42,7 +40,22 @@ TEMP_IMG       = os.path.join(_WRITE_DIR, "_temp_screenshot.png")
 HOTKEY_LOG = os.path.join(_WRITE_DIR, "hotkey_debug.log")
 
 def _kbd_state_snapshot():
-    return "[kbd状态] 使用 Win32 API 原生热键，已解决静默失效问题"
+    try:
+        listener = getattr(keyboard, '_listener', None)
+        has_listener = (listener is not None)
+        
+        t_alive = False
+        if has_listener:
+            if hasattr(listener, 'listening_thread') and listener.listening_thread:
+                t_alive = listener.listening_thread.is_alive()
+            else:
+                t_alive = True # 兼容不同版本 keyboard，无法获取则默认存活
+                
+        hk_cnt = len(getattr(keyboard, '_hotkeys', {}))
+        
+        return f"[kbd状态] listener={has_listener} thread_alive={t_alive} hotkeys={hk_cnt}"
+    except Exception as e:
+        return f"[kbd状态] 获取失败({e})"
 
 def _hklog(msg: str, level: str = "info", with_kbd_state: bool = True):
     """写入热键诊断日志，带时间戳、级别标签和可选的键盘系统状态快照"""
@@ -83,23 +96,6 @@ BTN_FG  = "#ffffff"
 # ─────────────────────────────────────────────
 #  OCR 核心
 # ─────────────────────────────────────────────
-
-# 修复：wcocr.init 只能调用一次，每次重新启动 WeChatOCR.exe
-# 子进程在 Win10 Defender 或杀毒软件扫描下可能阻塞数秒乃至更久，
-# 从而卡死 OCR worker 线程（表现：截图后程序假死/转圈）。
-# 改为全局只初始化一次，之后所有调用复用同一进程通道。
-_wcocr_initialized = False
-_wcocr_init_lock   = threading.Lock()
-
-def _ensure_wcocr_init():
-    global _wcocr_initialized
-    if _wcocr_initialized:
-        return
-    with _wcocr_init_lock:
-        if not _wcocr_initialized:  # double-check
-            wcocr.init(WECHATOCR_EXE, WECHAT_LIB_DIR)
-            _wcocr_initialized = True
-
 def do_ocr(image_path: str) -> str:
     res = do_ocr_raw(image_path)
     if isinstance(res, str):
@@ -110,7 +106,7 @@ def do_ocr(image_path: str) -> str:
 def do_ocr_raw(image_path: str):
     """返回原始结果: [{'text': 'abc', 'left': x, 'top': y, 'right': x, 'bottom': y}, ...]"""
     try:
-        _ensure_wcocr_init()
+        wcocr.init(WECHATOCR_EXE, WECHAT_LIB_DIR)
         result = wcocr.ocr(image_path)
         items = []
         for item in result.get("ocr_response", []):
@@ -298,35 +294,37 @@ def do_translate(text: str, target_lang: str, engine: str = "腾讯翻译") -> s
     return "（已收到识别结果直接展示）\n\n[翻译失败：所有免费接口（百度/有道/MyMemory）均不可达或被频率限制，请稍微检查网络后再试]"
 
 # ─────────────────────────────────────────────
-#  截图选区（微信风格：截图背景 + 框选区域亮显）
+#  截图选区（tkinter 全屏遮罩）
 # ─────────────────────────────────────────────
 def grab_region(app, callback, mode_name=""):
-    """在主线程中打开截图遮罩，完成后调用 callback(image_path, lx1,ly1,lx2,ly2, crop_img)
-    策略：立即弹出旧式 alpha 遮罩（不阻塞主线程），后台截全屏并升级为 PIL 合成图。
+    """在主线程中打开截图遮罩，完成后调用 callback(image_path)
+    支持多显示器：遮罩覆盖全部屏幕（含副屏/负坐标显示器）
+    支持右键或 ESC 取消截图
     """
-    from PIL import ImageTk
 
     def _open():
-        # ── 获取虚拟屏幕范围 ──────────────────────
+        # ── 获取虚拟屏幕范围（所有显示器合并后的总区域）──────
         try:
+            import ctypes
+            SM_XVIRTUALSCREEN  = 76   # 虚拟屏幕左边界（副屏在左时为负）
+            SM_YVIRTUALSCREEN  = 77   # 虚拟屏幕上边界（副屏在上时为负）
+            SM_CXVIRTUALSCREEN = 78   # 虚拟屏幕总宽度
+            SM_CYVIRTUALSCREEN = 79   # 虚拟屏幕总高度
             u32 = ctypes.windll.user32
-            vx  = u32.GetSystemMetrics(76)
-            vy  = u32.GetSystemMetrics(77)
-            vw  = u32.GetSystemMetrics(78)
-            vh  = u32.GetSystemMetrics(79)
+            vx  = u32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            vy  = u32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            vw  = u32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            vh  = u32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
         except Exception:
             vx, vy = 0, 0
             vw = app.winfo_screenwidth()
             vh = app.winfo_screenheight()
 
-        dpi_sx, dpi_sy = app._dpi_scale
-
-        # ── 1. 立即弹出旧式半透明遮罩（不阻塞主线程）──
         overlay = Toplevel(app)
-        overlay.overrideredirect(True)
-        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")
+        overlay.overrideredirect(True)                    # 无边框
+        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")         # 覆盖全部显示器
+        overlay.attributes("-alpha",   0.25)
         overlay.attributes("-topmost", True)
-        overlay.attributes("-alpha", 0.25)   # 和旧版完全一样，立即可见
         overlay.configure(bg="black")
         overlay.lift()
         overlay.focus_force()
@@ -335,187 +333,119 @@ def grab_region(app, callback, mode_name=""):
                         highlightthickness=0, width=vw, height=vh)
         canvas.pack(fill=tk.BOTH, expand=True)
 
+        # 提示文字（显示在虚拟屏幕中心）
         hint_str = "拖动鼠标框选区域"
         if mode_name:
             hint_str = f"[{mode_name}] " + hint_str
         hint_str += "  ·  右键 或 ESC 取消"
-        canvas.create_text(vw // 2, vh // 2, text=hint_str,
-                           fill="#ffffff", font=("微软雅黑", 18), tags="hint")
+        
+        canvas.create_text(
+            vw // 2, vh // 2,
+            text=hint_str,
+            fill="#ffffff", font=("微软雅黑", 18), tags="hint"
+        )
 
-        # _ref 在后台线程和主线程之间共享数据
-        _ref = {
-            "photo":       None,    # 当前 canvas PhotoImage（防 GC）
-            "pending":     False,   # 是否有待处理的重绘
-            "full_img":    None,    # 原始物理像素截图
-            "full_canvas": None,    # 逻辑像素缩放版
-            "dim_base":    None,    # 预合成暗色底图
-            "ready":       False,   # PIL 素材是否就绪
-        }
-
-        def _update_canvas(pil_img):
-            """主线程：把 PIL Image 渲染到 canvas 背景"""
-            photo = ImageTk.PhotoImage(pil_img)
-            canvas.delete("bg")
-            canvas.create_image(0, 0, anchor="nw", image=photo, tags="bg")
-            canvas.tag_lower("bg")
-            _ref["photo"] = photo
-
-        def _init_bg():
-            """后台线程：截全屏 → 准备合成底图（不阻塞 UI）"""
-            try:
-                sc_bbox = (
-                    int(vx * dpi_sx), int(vy * dpi_sy),
-                    int((vx + vw) * dpi_sx), int((vy + vh) * dpi_sy),
-                )
-                full_img    = ImageGrab.grab(bbox=sc_bbox, all_screens=True)
-                full_canvas = full_img.resize((vw, vh), Image.BILINEAR)
-                dark_overlay = Image.new("RGB", (vw, vh), (0, 0, 0))
-                dim_base    = Image.blend(full_canvas, dark_overlay, 0.25)
-                _ref["full_img"]    = full_img
-                _ref["full_canvas"] = full_canvas
-                _ref["dim_base"]    = dim_base
-                _ref["ready"]       = True
-                # 切换到 PIL 合成模式（去掉窗口 alpha，改用图像控制亮度）
-                overlay.after(0, _activate_composite)
-            except Exception:
-                pass   # 保持旧式 alpha 模式即可
-
-        def _activate_composite():
-            """主线程：PIL 就绪后，切换到合成图模式"""
-            try:
-                overlay.attributes("-alpha", 1.0)   # 不再用窗口 alpha
-                _update_canvas(_ref["dim_base"])
-            except Exception:
-                pass
-
-        threading.Thread(target=_init_bg, daemon=True).start()
-
-        state = {"sx": 0, "sy": 0}
+        state = {"sx": 0, "sy": 0, "rect": None}
 
         def on_press(e):
             state["sx"], state["sy"] = e.x_root, e.y_root
-            canvas.delete("hint")
-
-        def _redraw(cx1, cy1, cx2, cy2):
-            """主线程：选区亮显（仅 PIL 就绪后才合成）"""
-            if _ref["ready"] and _ref["full_canvas"] and _ref["dim_base"]:
-                composite = _ref["dim_base"].copy()
-                bx1, by1 = max(0, int(cx1)), max(0, int(cy1))
-                bx2, by2 = min(vw, int(cx2)), min(vh, int(cy2))
-                if bx2 > bx1 and by2 > by1:
-                    patch = _ref["full_canvas"].crop((bx1, by1, bx2, by2))
-                    composite.paste(patch, (bx1, by1))
-                _update_canvas(composite)
-            # 绿色选框
-            canvas.delete("sel_rect")
-            canvas.create_rectangle(
-                int(cx1), int(cy1), int(cx2), int(cy2),
-                outline="#22cc44", width=2, tags="sel_rect"
-            )
-            canvas.tag_raise("sel_rect")
-            _ref["pending"] = False
+            canvas.delete("hint")           # 按下后隐藏提示
 
         def on_drag(e):
-            if _ref["pending"]:
-                return
-            x1, y1 = state["sx"], state["sy"]
-            x2, y2 = e.x_root, e.y_root
-            cx1 = min(x1, x2) - vx
-            cy1 = min(y1, y2) - vy
-            cx2 = max(x1, x2) - vx
-            cy2 = max(y1, y2) - vy
-            if cx2 - cx1 < 3 or cy2 - cy1 < 3:
-                return
-            _ref["pending"] = True
-            overlay.after(20, lambda a=cx1,b=cy1,c=cx2,d=cy2: _redraw(a, b, c, d))
+            if state["rect"]:
+                canvas.delete(state["rect"])
+            # e.x_root/y_root 是绝对屏幕坐标，转为 canvas 内坐标
+            rx = state["sx"] - canvas.winfo_rootx()
+            ry = state["sy"] - canvas.winfo_rooty()
+            state["rect"] = canvas.create_rectangle(
+                rx, ry,
+                e.x_root - canvas.winfo_rootx(),
+                e.y_root - canvas.winfo_rooty(),
+                outline="#22cc44", width=2
+            )
 
         def on_release(e):
             x1, y1 = state["sx"], state["sy"]
             x2, y2 = e.x_root, e.y_root
             overlay.destroy()
+            overlay.update()
 
-            lx1, ly1 = int(min(x1, x2)), int(min(y1, y2))
-            lx2, ly2 = int(max(x1, x2)), int(max(y1, y2))
-
-            if abs(lx2 - lx1) < 5 or abs(ly2 - ly1) < 5:
+            if abs(x2 - x1) < 5 or abs(y2 - y1) < 5:
                 app.after(0, lambda: app.status("框选区域太小，已取消"))
                 return
 
+            # 逻辑坐标（用于弹窗位置，可能包含<0的副屏坐标）
+            lx1, ly1 = int(min(x1, x2)), int(min(y1, y2))
+            lx2, ly2 = int(max(x1, x2)), int(max(y1, y2))
+
+            # DPI 缩放 → 物理像素（用于截图，all_screens=True 支持负坐标）
+            sx, sy = app._dpi_scale
+            bbox = (
+                int(lx1 * sx), int(ly1 * sy),
+                int(lx2 * sx), int(ly2 * sy),
+            )
+
+            # 延迟 150ms 确保遮罩消失后再截图
             def _do_grab():
-                full_img = _ref.get("full_img")
-                if full_img:
-                    fx1 = max(0, min(int((lx1 - vx) * dpi_sx), full_img.width))
-                    fy1 = max(0, min(int((ly1 - vy) * dpi_sy), full_img.height))
-                    fx2 = max(0, min(int((lx2 - vx) * dpi_sx), full_img.width))
-                    fy2 = max(0, min(int((ly2 - vy) * dpi_sy), full_img.height))
-                    crop_img = full_img.crop((fx1, fy1, fx2, fy2))
-                    crop_img.save(TEMP_IMG)
-                else:
-                    import time
-                    time.sleep(0.15)
-                    bbox = (int(lx1*dpi_sx), int(ly1*dpi_sy),
-                            int(lx2*dpi_sx), int(ly2*dpi_sy))
-                    crop_img = ImageGrab.grab(bbox=bbox, all_screens=True)
-                    crop_img.save(TEMP_IMG)
-                app.after(0, lambda: callback(TEMP_IMG, lx1, ly1, lx2, ly2, crop_img))
+                import time
+                time.sleep(0.15)
+                img = ImageGrab.grab(bbox=bbox, all_screens=True)
+                img.save(TEMP_IMG)
+                # 传入逻辑坐标给 callback
+                callback(TEMP_IMG, lx1, ly1, lx2, ly2)
 
             threading.Thread(target=_do_grab, daemon=True).start()
 
         def _cancel(e=None):
             overlay.destroy()
-            app._capturing = False   # 释放单例锁
             app.status("已取消截图")
             return "break"
 
-        def _rclick_press(e):   return "break"
-        def _rclick_release(e): return _cancel()
+        def _rclick_press(e):
+            return "break"   # 消耗右键按下事件，防止弹出底层的系统菜单
+
+        def _rclick_release(e):
+            return _cancel()
 
         canvas.bind("<ButtonPress-1>",   on_press)
         canvas.bind("<B1-Motion>",       on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
+        
+        # 右键退出绑定（必须同时吸收 Press 和 Release，避免底层冒泡）
         canvas.bind("<ButtonPress-3>",   _rclick_press)
         canvas.bind("<ButtonRelease-3>", _rclick_release)
         overlay.bind("<ButtonPress-3>",  _rclick_press)
         overlay.bind("<ButtonRelease-3>",_rclick_release)
+        
         overlay.bind("<Escape>", _cancel)
 
-    app.after(0, _open)
-
-
+    app.after(0, _open)      # 必须在主线程调用 tkinter
 
 
 # ─────────────────────────────────────────────
-#  原位覆盖结果层（微信同款：截图原图为背景，译文原位渲染）
+#  原位覆盖结果层（与微信截屏翻译效果相同）
 # ─────────────────────────────────────────────
 class InPlaceOverlay(Toplevel):
     """
     微信原生截图翻译效果：
-    - 以截图原图作 Canvas 背景，背景/中文/图标等一概不变
-    - 仅在 OCR 文字坐标处直接渲染译文（无任何底色块）
-    - 字体颜色从截图对应区域自动采样
+    白色背景 + 绿色边框 + 译文直接覆盖选区 + 下方工具栏
     ❗ 必须在主线程中创建！
     """
 
-    def __init__(self, parent, lx1: int, ly1: int, lx2: int, ly2: int,
-                 mode: str, bg_img=None, dpi_scale=(1.0, 1.0)):
+    def __init__(self, parent, lx1: int, ly1: int, lx2: int, ly2: int, mode: str):
         super().__init__(parent)
         self.overrideredirect(True)
         self.attributes("-topmost", True)
-        self.configure(bg="black",
+        # 白色背景 + 绿色边框（与微信完全一致）
+        self.configure(bg="white",
                        highlightthickness=2,
                        highlightbackground="#22cc44")
-        self._mode      = mode
-        self._ocr_txt   = ""
-        self._tr_txt    = ""
-        self._last_items     = None     # 存储 OCR items，用于译文/原文切换
-        self._showing_original = False  # 当前是否显示原文
-        self._toggle_btn     = None     # 原文/译文 切换按钮引用
-        self._parent    = parent
-        self._toolbar   = None
-        self._text_ids  = []
-        self._bg_img    = bg_img
-        self._dpi_scale = dpi_scale
-        self._photo_ref = None
+        self._mode    = mode
+        self._ocr_txt = ""
+        self._tr_txt  = ""
+        self._parent  = parent
+        self._toolbar = None
+        self._trans_labels = []
 
         sw = parent.winfo_screenwidth()
         sh = parent.winfo_screenheight()
@@ -523,137 +453,27 @@ class InPlaceOverlay(Toplevel):
         h  = max(ly2 - ly1, 40)
         self._px = max(0, min(lx1, sw - w))
         self._py = max(0, min(ly1, sh - h))
-        self._win_w, self._win_h = w, h
+        self._win_w, self._win_h = w, h         # 注意：不能用 self._w，那是 tkinter 内部属性
         self.geometry(f"{w}x{h}+{self._px}+{self._py}")
 
-        self._canvas = Canvas(self, bg="black", highlightthickness=0,
-                              width=w, height=h)
-        self._canvas.pack(fill=tk.BOTH, expand=True)
-
-        if bg_img:
-            self._render_bg(bg_img, w, h)
-            if mode == "translate":
-                self._canvas.create_text(
-                    w // 2, h // 2, text="翻译中\u2026",
-                    fill="#ffffff", font=("微软雅黑", 13), tags="loading"
-                )
-        else:
-            self._canvas.configure(bg="white")
-            self._canvas.create_text(
-                w // 2, h // 2,
-                text="翻译中\u2026" if mode == "translate" else "识别中\u2026",
-                fill="#111111", font=("微软雅黑", 11), tags="loading"
-            )
-
-        self._fallback_var = tk.StringVar(value="")
-        self._fallback_lbl = tk.Label(
-            self, textvariable=self._fallback_var,
+        # 内容标签：白底黑字，直接显示译文（与微信一致）
+        init = "翻译中…" if mode == "translate" else "识别中…"
+        self._text_var = tk.StringVar(value=init)
+        self._lbl = tk.Label(
+            self, textvariable=self._text_var,
             bg="white", fg="#111111",
-            font=("微软雅黑", 11), wraplength=w - 16,
-            justify=tk.LEFT, anchor="nw", padx=8, pady=6
+            font=("微软雅黑", 11),
+            wraplength=w - 16,
+            justify=tk.LEFT, anchor="nw",
+            padx=8, pady=6
         )
-
+        self._lbl.pack(fill=tk.BOTH, expand=True)
         self._build_toolbar(sh)
+        # 创建后立即抓取焦点，这样 ESC 无需先点击即可生效
         self.focus_force()
 
-    def _render_bg(self, pil_img, w, h):
-        from PIL import ImageTk
-        try:
-            display = pil_img.resize((w, h), Image.BILINEAR)
-            photo = ImageTk.PhotoImage(display)
-            self._canvas.delete("bg_img")
-            self._canvas.create_image(0, 0, anchor="nw", image=photo, tags="bg_img")
-            self._canvas.tag_lower("bg_img")
-            self._photo_ref = photo
-        except Exception:
-            pass
-
-    def _erase_text_regions(self, pil_img, items):
-        """
-        把 OCR 识别到的每个文字区域用周边背景色填充，
-        彻底抹去原文像素，避免翻译文字与原文叠加错乱。
-        返回处理后的新 PIL Image（不修改原图）。
-        """
-        from PIL import ImageDraw
-        img  = pil_img.copy().convert("RGB")
-        draw = ImageDraw.Draw(img)
-        iw, ih = img.size
-        BORDER = 4          # 向外采样这么多像素作为背景色
-
-        for item in items:
-            x1 = max(0, int(item.get("left",  0)))
-            y1 = max(0, int(item.get("top",   0)))
-            x2 = min(iw, int(item.get("right", 0)))
-            y2 = min(ih, int(item.get("bottom",0)))
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            # 采样四条边外侧的像素作为背景色估计
-            border_pixels = []
-            # 上边
-            for bx in range(max(0, x1 - BORDER), min(iw, x2 + BORDER)):
-                for by in range(max(0, y1 - BORDER), y1):
-                    border_pixels.append(img.getpixel((bx, by))[:3])
-            # 下边
-            for bx in range(max(0, x1 - BORDER), min(iw, x2 + BORDER)):
-                for by in range(y2, min(ih, y2 + BORDER)):
-                    border_pixels.append(img.getpixel((bx, by))[:3])
-            # 左边
-            for bx in range(max(0, x1 - BORDER), x1):
-                for by in range(y1, y2):
-                    border_pixels.append(img.getpixel((bx, by))[:3])
-            # 右边
-            for bx in range(x2, min(iw, x2 + BORDER)):
-                for by in range(y1, y2):
-                    border_pixels.append(img.getpixel((bx, by))[:3])
-
-            if border_pixels:
-                r = sum(p[0] for p in border_pixels) // len(border_pixels)
-                g = sum(p[1] for p in border_pixels) // len(border_pixels)
-                b = sum(p[2] for p in border_pixels) // len(border_pixels)
-                fill = (r, g, b)
-            else:
-                fill = (240, 240, 240)
-
-            # 填充文字区域（稍微向外扩 1px 覆盖边缘）
-            draw.rectangle(
-                [max(0, x1 - 1), max(0, y1 - 1),
-                 min(iw, x2 + 1), min(ih, y2 + 1)],
-                fill=fill
-            )
-        return img
-
-    def _sample_text_color(self, x1, y1, x2, y2):
-        if not self._bg_img:
-            return "#ffffff"
-        try:
-            iw, ih = self._bg_img.size
-            rx1, ry1 = max(0, x1), max(0, y1)
-            rx2, ry2 = min(iw, x2), min(ih, y2)
-            if rx2 <= rx1 or ry2 <= ry1:
-                return "#ffffff"
-            region = self._bg_img.crop((rx1, ry1, rx2, ry2)).convert("RGB")
-            pixels = list(region.getdata())
-            if not pixels:
-                return "#ffffff"
-            brightnesses = [(r * 299 + g * 587 + b * 114) // 1000 for r, g, b in pixels]
-            avg_br = sum(brightnesses) // len(brightnesses)
-            if avg_br > 128:
-                cands = [pixels[i] for i, b in enumerate(brightnesses) if b < avg_br - 30]
-                if not cands:
-                    return "#111111"
-            else:
-                cands = [pixels[i] for i, b in enumerate(brightnesses) if b > avg_br + 30]
-                if not cands:
-                    return "#ffffff"
-            r = sum(p[0] for p in cands) // len(cands)
-            g = sum(p[1] for p in cands) // len(cands)
-            b = sum(p[2] for p in cands) // len(cands)
-            return f"#{r:02x}{g:02x}{b:02x}"
-        except Exception:
-            return "#ffffff"
-
-    def _build_toolbar(self, sh):
+    def _build_toolbar(self, sh: int):
+        """在选区正下方创建微信风格小工具栏"""
         tb = Toplevel(self._parent)
         tb.overrideredirect(True)
         tb.attributes("-topmost", True)
@@ -667,15 +487,14 @@ class InPlaceOverlay(Toplevel):
         tb.geometry(f"{TW}x{TH}+{tx}+{ty}")
         bar = tk.Frame(tb, bg="#2b2b2b")
         bar.pack(fill=tk.BOTH, expand=True, padx=4, pady=3)
-        self._tbtn(bar, "\U0001f4cb 复制", self._do_copy).pack(side=tk.LEFT, padx=4)
+        self._tbtn(bar, "📋 复制", self._do_copy).pack(side=tk.LEFT, padx=4)
         if self._mode == "translate":
-            btn = self._tbtn(bar, "原文", self._toggle_view)
-            btn.pack(side=tk.LEFT, padx=2)
-            self._toggle_btn = btn
-        self._tbtn(bar, "\xd7", self._close_all,
+            self._tbtn(bar, "原文", self._show_ocr).pack(side=tk.LEFT, padx=2)
+        self._tbtn(bar, "×", self._close_all,
                    fg="#ff5555", bg="#3d2222").pack(side=tk.RIGHT, padx=4)
-        self._tbtn(bar, "\u2713", self._close_all,
+        self._tbtn(bar, "✓", self._close_all,
                    fg="#44dd44", bg="#1e3323").pack(side=tk.RIGHT, padx=2)
+        # ESC 关闭翻译窗
         self.bind("<Escape>", lambda e: self._close_all())
         tb.bind("<Escape>", lambda e: self._close_all())
 
@@ -689,103 +508,119 @@ class InPlaceOverlay(Toplevel):
     def set_ocr(self, text: str):
         self._ocr_txt = text
         if self._mode == "ocr":
-            self._canvas.delete("loading")
-            self._canvas.create_text(
-                8, 8, text=text, fill="#111111",
-                font=("微软雅黑", 11), anchor="nw",
-                width=self._win_w - 16, tags="ocr_text"
-            )
+            self._text_var.set(text)
 
     def set_trans(self, text: str, items=None):
-        self._tr_txt       = text
-        self._last_items   = items      # 存储 items 供切换用
-        self._showing_original = False  # 重置到译文视图
-        if self._toggle_btn:
-            self._toggle_btn.config(text="原文")
-        if self._mode != "translate":
-            return
+        self._tr_txt = text
+        if self._mode == "translate":
+            self._lbl.config(fg="#111111")
+            
+            # 清理旧的独立标签
+            for lbl in self._trans_labels:
+                lbl.destroy()
+            self._trans_labels.clear()
+            
+            # 基础宽高
+            w = self.winfo_width()
+            sw = self.winfo_screenwidth()
+            
+            # ========================
+            # 多排版智能渲染（如果有坐标+行数对应）
+            # ========================
+            if items:
+                # 把原文和翻译结果按行拆分进行数量比对
+                translated_lines = [l.strip() for l in text.split("\n") if l.strip()]
+                original_lines = [item for item in items if item.get("text", "").strip()]
+                
+                if len(translated_lines) == len(original_lines) and len(original_lines) > 0:
+                    # ✅ 美好情况：翻译结果的行数和原文一致！完美执行原位覆盖！
+                    # 我们先把原本用于显示大段落的大 Label 隐藏掉：
+                    self._text_var.set("")
+                    self._lbl.config(wraplength=0) # 禁用
+                    
+                    # 为了确定新窗口大小，追踪最底部的文字边界
+                    max_bottom = 0
+                    min_left = sw
+                    max_right = 0
+                    
+                    for idx, item in enumerate(original_lines):
+                        t_txt = translated_lines[idx]
+                        
+                        # 解析原本的坐标
+                        left = int(item["left"])
+                        top = int(item["top"])
+                        right = int(item["right"])
+                        bot = int(item["bottom"])
+                        
+                        # 行高和最大宽度
+                        row_h = bot - top
+                        row_w = max(50, right - left) # 宽度给足一点
+                        
+                        # 为了避免完全遮挡原来图片的间隙，给个细微修正
+                        lbl = tk.Label(self, text=t_txt,
+                                     bg="#eef2f5", fg="#111111", 
+                                     font=("微软雅黑", max(9, min(14, int(row_h * 0.7)))),
+                                     justify=tk.LEFT, anchor="nw", 
+                                     wraplength=row_w + 100)
+                        
+                        # 覆盖在原图片的准确位置上，向外拓宽一点点视觉效果更好
+                        x_pos = max(0, left - 4)
+                        y_pos = max(0, top - 2)
+                        
+                        lbl.place(x=x_pos, y=y_pos)
+                        self._trans_labels.append(lbl)
+                        
+                        lbl.update_idletasks()
+                        l_reqh = lbl.winfo_reqheight()
+                        
+                        max_bottom = max(max_bottom, y_pos + l_reqh)
+                        min_left = min(min_left, x_pos)
+                        max_right = max(max_right, x_pos + lbl.winfo_reqwidth())
+                        
+                    req_h = max_bottom + 16
+                    new_w = max(w, max_right - min_left + 10)
+                else:
+                    # ❌ 糟糕情况：遇到大长句，翻译引擎把它合并成了1段或重新分段了。
+                    # 回退到我们以前的中心展示模式
+                    self._text_var.set(text)
+                    self._lbl.config(wraplength=max(200, w - 20))
+                    self.update_idletasks()
+                    req_h = self._lbl.winfo_reqheight() + 16
+                    new_w = w
+            else:
+                self._text_var.set(text)
+                self._lbl.config(wraplength=max(200, w - 20))
+                self.update_idletasks()
+                req_h = self._lbl.winfo_reqheight() + 16
+                new_w = w
 
-        self._canvas.delete("loading")
-        for tid in self._text_ids:
-            self._canvas.delete(tid)
-        self._text_ids.clear()
-        self._fallback_lbl.place_forget()
-
-        dpi_sx, dpi_sy = self._dpi_scale
-        w = self._win_w
-        h = self._win_h
-
-        translated_lines = [l.strip() for l in text.split("\n") if l.strip()]
-        original_lines   = [it for it in (items or []) if it.get("text", "").strip()]
-
-        if original_lines and len(translated_lines) == len(original_lines):
-            # ── 先抹掉背景图中的原文像素，再渲染，避免叠字 ────
-            if self._bg_img:
-                erased = self._erase_text_regions(self._bg_img, original_lines)
-                self._render_bg(erased, w, h)
-
-            for idx, item in enumerate(original_lines):
-                t_txt = translated_lines[idx]
-                px1, py1 = int(item["left"]),  int(item["top"])
-                px2, py2 = int(item["right"]), int(item["bottom"])
-                cx  = int(px1 / dpi_sx)
-                cy  = int(py1 / dpi_sy)
-                row_h_px = py2 - py1
-                font_pt  = max(8, min(18, int(row_h_px / dpi_sy * 0.85)))
-                fg_color = self._sample_text_color(px1, py1, px2, py2)
-                tid = self._canvas.create_text(
-                    cx, cy, text=t_txt,
-                    fill=fg_color,
-                    font=("微软雅黑", font_pt),
-                    anchor="nw", tags="trans_text"
-                )
-                self._text_ids.append(tid)
-        else:
-            if self._bg_img:
-                self._render_bg(self._bg_img, w, h)
-            self._fallback_var.set(text)
-            self._fallback_lbl.configure(wraplength=w - 16)
-            self._fallback_lbl.place(x=0, y=0, width=w)
-
-    def _toggle_view(self):
-        """在译文 ↔ 原文之间切换，按钮文字同步更新"""
-        if self._showing_original:
-            # 当前显示原文 → 切回译文
-            self._showing_original = False
-            if self._toggle_btn:
-                self._toggle_btn.config(text="原文")
-            # 清除原文背景，重新渲染抹字背景+译文
-            self._canvas.delete("ocr_text")
-            for tid in self._text_ids:
-                self._canvas.delete(tid)
-            self._text_ids.clear()
-            self._fallback_lbl.place_forget()
-            # 重新走 set_trans 渲染路径（不重复翻译，直接用缓存）
-            self.set_trans(self._tr_txt, self._last_items)
-        else:
-            # 当前显示译文 → 切到原文
-            self._showing_original = True
-            if self._toggle_btn:
-                self._toggle_btn.config(text="译文")
-            self._show_ocr()
+            new_h = max(self._win_h, req_h)
+            new_w = max(new_w, self.winfo_width())
+            
+            x = self.winfo_x()
+            y = self.winfo_y()
+            if x + new_w > sw - 10:
+                x = max(10, sw - new_w - 10)
+            
+            self.geometry(f"{new_w}x{new_h}+{x}+{y}")
+            self._win_h = new_h
+            
+            if getattr(self, "_toolbar", None):
+                tb_w, tb_h = 240, 34
+                tx = x + (new_w - tb_w) // 2
+                ty = y + new_h + 3
+                if ty + tb_h > self.winfo_screenheight() - 10:
+                    ty = y - tb_h - 3
+                self._toolbar.geometry(f"{tb_w}x{tb_h}+{tx}+{ty}")
 
     def _show_ocr(self):
-        """显示原文视图：清除译文，还原截图原图"""
-        for tid in self._text_ids:
-            self._canvas.delete(tid)
-        self._text_ids.clear()
-        self._canvas.delete("loading")
-        self._canvas.delete("ocr_text")
-        self._fallback_lbl.place_forget()
-        # 还原未抹字版的原始截图背景即可，英文文字已在图中
-        if self._bg_img:
-            self._render_bg(self._bg_img, self._win_w, self._win_h)
-
+        if self._ocr_txt:
+            self._text_var.set(self._ocr_txt)
+            self._lbl.config(fg="#666688")
 
     def _do_copy(self):
         t = self._tr_txt or self._ocr_txt
-        if t:
-            pyperclip.copy(t)
+        if t: pyperclip.copy(t)
 
     def _close_all(self):
         for w in (self._toolbar, self):
@@ -806,7 +641,6 @@ class InPlaceOverlay(Toplevel):
 
 
 
-
 try:
     import pystray as _pystray
     _PYSTRAY = True
@@ -817,77 +651,6 @@ except ImportError:
 # ─────────────────────────────────────────────
 #  紧凑浮动工具条（主窗口）
 # ─────────────────────────────────────────────
-
-class Win32HotkeyManager:
-    """原生的 Win32 消息循环热键管理器，系统级接管，彻底解决因为卡顿或UAC导致的钩子静默丢弃问题。"""
-    def __init__(self, app, callback):
-        self.app = app
-        self.callback = callback
-        self._thread = None
-        self._thread_id = None
-        
-    def _parse_hotkey(self, hk_str):
-        mods, vk = 0, 0
-        parts = str(hk_str).lower().split('+')
-        # MOD_ALT=1, MOD_CTRL=2, MOD_SHIFT=4, MOD_WIN=8
-        vk_map = {'page up': 0x21, 'page down': 0x22, 'end': 0x23, 'home': 0x24,
-                  'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28, 'enter': 0x0D, 'esc': 0x1B}
-        for p in parts:
-            p = p.strip()
-            if not p: continue
-            if p == 'ctrl': mods |= 2
-            elif p in ('alt', 'option'): mods |= 1
-            elif p == 'shift': mods |= 4
-            elif p in ('win', 'windows', 'command'): mods |= 8
-            elif p in vk_map: vk = vk_map[p]
-            elif len(p) == 1: vk = ord(p.upper())
-            elif p.startswith('f') and p[1:].isdigit(): vk = 0x6F + int(p[1:])
-        return mods, vk
-
-    def start(self, hotkeys_dict):
-        self.stop()
-        started = threading.Event()
-        
-        def _run():
-            try:
-                self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
-                user32 = ctypes.windll.user32
-                actions = {}
-                for icls, (mode, hk_str) in enumerate(hotkeys_dict.items(), 1):
-                    mods, vk = self._parse_hotkey(hk_str)
-                    if vk:
-                        user32.RegisterHotKey(None, icls, mods | 0x4000, vk) # 0x4000=MOD_NOREPEAT
-                        actions[icls] = mode
-                
-                started.set()
-                msg = wintypes.MSG()
-                while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-                    if msg.message == 0x0312:  # WM_HOTKEY
-                        action = actions.get(msg.wParam)
-                        if action:
-                            # 必须通过 tkinter.after 在主线程执行，避免跨线程调用异常
-                            self.app.after(0, lambda a=action: self.callback(a))
-                    elif msg.message == 0x0012: # WM_QUIT
-                        break
-                    user32.TranslateMessage(ctypes.byref(msg))
-                    user32.DispatchMessageW(ctypes.byref(msg))
-                    
-                for icls in actions:
-                    user32.UnregisterHotKey(None, icls)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-        
-        self._thread = threading.Thread(target=_run, daemon=True)
-        self._thread.start()
-        started.wait(timeout=2.0)
-
-    def stop(self):
-        if self._thread and self._thread.is_alive() and getattr(self, '_thread_id', None):
-            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)
-            self._thread.join(timeout=1.0)
-            self._thread_id = None
-
 class CompactBar(tk.Tk):
     """
     橙黄色小工具条，模仿参考图：
@@ -925,10 +688,9 @@ class CompactBar(tk.Tk):
 
         self._build()
         self._registered_hotkeys = {}   # 记录已注册热键 {action: combo}
-        self._hotkey_mgr = Win32HotkeyManager(self, self._cap)
         self._register_hotkeys()
         self._setup_tray()
-        # watchdog 不再需要，Win32 API 安全稳定不再掉签
+        self._hotkey_watchdog()          # 启动热键看门狗
 
     # ── DPI ──────────────────────────────────
     def _calc_dpi(self):
@@ -957,21 +719,9 @@ class CompactBar(tk.Tk):
         self.bind("<Button-3>", lambda e: self.after(0, self._hotkeys_dialog))
         title.bind("<Button-3>", lambda e: self.after(0, self._hotkeys_dialog) or "break")
 
-        # 按钮顺序：翻译 → 提取文字 → 截图 → 扫码 → 生成QR
-        self._btn_frames = {}  # mode → hk_label ，用于设置更新快捷键
-        cfg_hk = _load_config().get("hotkeys", {})
-        for label, mode, default_hk in [
-            ("译",    "translate",  "alt+1"),
-            ("提取文字", "ocr",        "alt+2"),
-            ("截  图", "screenshot", "alt+3"),
-            ("扫  码", "qrcode",    "alt+4"),
-            ("生成QR", "gen_qr",    "alt+5"),
-        ]:
+        for label, mode in [("提取文字","ocr"), ("截  图","screenshot"), ("译","translate"), ("扫  码","qrcode"), ("生成QR","gen_qr")]:
             self._div()
-            hk_text = cfg_hk.get(mode, default_hk)
-            hk_lbl  = self._bb(label, hk_text, lambda m=mode: self._cap(m))
-            self._btn_frames[mode] = hk_lbl
-
+            self._bb(label, lambda m=mode: self._cap(m))
 
         # 最小化按钮
         self._div()
@@ -984,66 +734,107 @@ class CompactBar(tk.Tk):
         tk.Frame(self, bg="#cc8800", width=1).pack(
             side=tk.LEFT, fill=tk.Y, pady=3)
 
-    def _bb(self, text, hotkey, cmd):
-        """创建带快捷键小字的工具栏按钮，返回快捷键 Label 引用"""
-        container = tk.Frame(self, bg=self.BAR_BG, cursor="hand2")
-        container.pack(side=tk.LEFT)
-
-        btn = tk.Button(
-            container, text=text,
-            bg=self.BAR_BG, fg=self.TXT_COL,
-            font=("微软雅黑", 9), bd=0, relief=tk.FLAT,
-            padx=8, pady=3, cursor="hand2",
-            activebackground=self.HOV_BG,
-            activeforeground=self.TXT_COL,
-            command=cmd
-        )
-        btn.pack(side=tk.TOP)
-
-        hk_lbl = tk.Label(
-            container, text=hotkey,
-            bg="#cc8800", fg="#ffffff",     # 加深的橙色底块，纯白加粗文字，增强对比
-            font=("Arial", 8, "bold"),
-            padx=4, pady=1
-        )
-        hk_lbl.pack(side=tk.TOP)
-        # 容器和小字同样响应点击
-        container.bind("<Button-1>", lambda e: cmd())
-        hk_lbl.bind("<Button-1>",   lambda e: cmd())
-        return hk_lbl
-
+    def _bb(self, text, cmd):
+        b = tk.Button(self, text=text,
+                      bg=self.BAR_BG, fg=self.TXT_COL,
+                      font=("微软雅黑", 9), bd=0, relief=tk.FLAT,
+                      padx=10, pady=5, cursor="hand2",
+                      activebackground=self.HOV_BG,
+                      activeforeground=self.TXT_COL,
+                      command=cmd)
+        b.pack(side=tk.LEFT)
 
     # ── 热键 ─────────────────────────────────
     def _register_hotkeys(self):
-        _hklog(">>> _register_hotkeys() 调用开始 (Win32 API)")
+        _hklog(">>> _register_hotkeys() 调用开始")
         try:
             cfg = _load_config().get("hotkeys", {})
-            h1 = cfg.get("translate",  "alt+1")
-            h2 = cfg.get("ocr",        "alt+2")
+            h1 = cfg.get("translate", "alt+1")
+            h2 = cfg.get("ocr", "alt+2")
             h3 = cfg.get("screenshot", "alt+3")
-            h4 = cfg.get("qrcode",    "alt+4")
-            h5 = cfg.get("gen_qr",    "alt+5")
-            _hklog(f"    准备注册 (Win32): translate={h1!r}  ocr={h2!r} screenshot={h3!r} qrcode={h4!r} gen_qr={h5!r}")
-
+            h4 = cfg.get("qrcode", "alt+4")
+            h5 = cfg.get("gen_qr", "alt+5")
+            _hklog(f"    准备注册: translate={h1!r}  ocr={h2!r} screenshot={h3!r} qrcode={h4!r} gen_qr={h5!r}")
+            keyboard.unhook_all()   # 先清空旧钩子，防止重复注册
+            if hasattr(keyboard, '_hotkeys'):
+                keyboard._hotkeys.clear()  # 手动清空内部字典，防止无限膨胀
+            _hklog("    unhook_all() 完成")
+            keyboard.add_hotkey(h1, lambda: self.after(0, lambda: self._cap("translate")))
+            keyboard.add_hotkey(h2, lambda: self.after(0, lambda: self._cap("ocr")))
+            keyboard.add_hotkey(h3, lambda: self.after(0, lambda: self._cap("screenshot")))
+            keyboard.add_hotkey(h4, lambda: self.after(0, lambda: self._cap("qrcode")))
+            keyboard.add_hotkey(h5, lambda: self.after(0, lambda: self._cap("gen_qr")))
             self._registered_hotkeys = {"translate": h1, "ocr": h2, "screenshot": h3, "qrcode": h4, "gen_qr": h5}
-            self._hotkey_mgr.start(self._registered_hotkeys)
-
             _hklog(f"    热键注册成功: {self._registered_hotkeys}")
-
-            # 刷新悬浮窗快捷键标签（仅当 _btn_frames 已创建时）
-            btns = getattr(self, "_btn_frames", {})
-            for mode, lbl in btns.items():
-                try:
-                    lbl.config(text=self._registered_hotkeys.get(mode, ""))
-                except Exception:
-                    pass
-
         except Exception as ex:
             _hklog(f"!!! 热键注册失败: {ex}", "error")
-            print(f"[热键注册失败] {ex}")
+            print(f"[热键注册失败] {ex}（需要管理员权限，或快捷键冲突）")
 
     def _hotkey_watchdog(self):
-        pass # 已废弃，因为我们改用了原生稳定的 Win32HotkeyManager
+        """每 5 秒检查一次 keyboard 钩子是否存活，失效时自动重新注册并记录诊断日志。
+
+        Windows 低级键盘钩子（SetWindowsHookEx）在以下情况会静默失效：
+          - 系统 UAC 弹窗 / 安全桌面切换
+          - 全屏游戏/程序抢占输入焦点
+          - 宿主线程消息队列积压超时（系统会自动移除钩子）
+
+        双重检测策略：
+          1. 检查 keyboard 内部监听线程是否活着
+          2. 检查已注册热键回调表是否为空
+        任一条件不满足且曾注册过热键，则触发重注册。
+        """
+        # 看门狗计数器，每 60 次（约 5 分钟）写一次心跳日志
+        self._watchdog_tick = getattr(self, '_watchdog_tick', 0) + 1
+        write_heartbeat = (self._watchdog_tick % 60 == 1)
+
+        def _check():
+            needs_reregister = False
+            reason = ""
+            try:
+                # 检测1：keyboard 内部监听线程是否还活着
+                listener = getattr(keyboard, '_listener', None)
+                t_alive = False
+                if listener is not None:
+                    if hasattr(listener, 'listening_thread') and listener.listening_thread:
+                        t_alive = listener.listening_thread.is_alive()
+                    else:
+                        t_alive = True
+
+                if listener is not None and not t_alive:
+                    needs_reregister = True
+                    reason = "监听线程已死亡"
+
+                # 检测2：热键回调表是否为空
+                if not needs_reregister:
+                    hk_dict = getattr(keyboard, '_hotkeys', {})
+                    if not hk_dict and self._registered_hotkeys:
+                        needs_reregister = True
+                        reason = "热键回调表(_hotkeys)意外置空"
+
+                # 心跳日志（每 5 分钟）
+                if write_heartbeat:
+                    _hklog(f"[心跳] tick={self._watchdog_tick} needs_reregister={needs_reregister}")
+
+            except Exception as ex:
+                needs_reregister = True
+                reason = f"看门狗检测异常: {ex}"
+                _hklog(f"!!! 看门狗检测异常: {ex}", "error")
+
+            if needs_reregister and self._registered_hotkeys:
+                _hklog(f">>> 触发重注册，原因: {reason}", "warning")
+                print(f"[热键看门狗] {reason}，正在重新注册...")
+                try:
+                    self._register_hotkeys()
+                except Exception as ex:
+                    _hklog(f"!!! 重注册失败: {ex}", "error")
+                    print(f"[热键看门狗] 重注册失败: {ex}")
+
+        try:
+            _check()
+        except Exception as ex:
+            _hklog(f"!!! _check() 未捕获异常: {ex}", "error")
+        # 每 5000ms 再次检查（使用 tkinter after，运行在主线程，线程安全）
+        self.after(5000, self._hotkey_watchdog)
 
     # ── 系统托盘 ─────────────────────────────
     def _setup_tray(self):
@@ -1093,7 +884,7 @@ class CompactBar(tk.Tk):
         if self._tray:
             try: self._tray.stop()
             except Exception: pass
-        try: getattr(self, '_hotkey_mgr', None) and self._hotkey_mgr.stop()
+        try: keyboard.unhook_all()
         except Exception: pass
         self.destroy()
 
@@ -1135,16 +926,9 @@ class CompactBar(tk.Tk):
                 if e.state & 0x0001: mods.append("shift")
                 
                 k = e.keysym.lower()
-                
-                # 强制修复 Windows 下由于按住 Alt 导致的键位识别错乱 (比如变成 `??` 或被当成 ascii 自定义输入)
-                if getattr(e, "keycode", 0):
-                    if 96 <= e.keycode <= 105:
-                        k = f"numpad{e.keycode - 96}"
-                    elif 48 <= e.keycode <= 57:
-                        k = str(e.keycode - 48)
                 if k.startswith("mouse") or not k: return "break"
                 
-                km = {"prior": "page up", "next": "page down", "return": "enter", "escape": "esc", "kp_1": "numpad1", "kp_2": "numpad2", "kp_3": "numpad3", "kp_4": "numpad4", "kp_5": "numpad5", "kp_6": "numpad6", "kp_7": "numpad7", "kp_8": "numpad8", "kp_9": "numpad9", "kp_0": "numpad0"}
+                km = {"prior": "page up", "next": "page down", "return": "enter", "escape": "esc"}
                 k = km.get(k, k)
                 hk = "+".join(mods + [k])
                 entry.delete(0, tk.END)
@@ -1259,6 +1043,7 @@ class CompactBar(tk.Tk):
             
             # 重新注册热键
             try:
+                keyboard.unhook_all()
                 self._register_hotkeys()
             except Exception:
                 pass
@@ -1333,28 +1118,16 @@ class CompactBar(tk.Tk):
         tk.Button(bar, text="打开所在文件夹", bg=PANEL, fg=TEXT,
                   font=("微软雅黑", 9), bd=0, padx=10, pady=4,
                   cursor="hand2", command=_open_folder).pack(side=tk.LEFT, padx=4)
+
         tk.Button(bar, text="关闭", bg=PANEL, fg=SUBTEXT,
                   font=("微软雅黑", 9), bd=0, padx=10, pady=4,
                   cursor="hand2", command=lw.destroy).pack(side=tk.RIGHT, padx=4)
 
-    # ── 截图入口（全局单例：先关旧弹窗再开新的）────
+    # ── 截图入口 ─────────────────────────────
     def _cap(self, mode: str):
+        # 截图提取文字/翻译时不再隐藏工具条
+        # self.withdraw()
         _hklog(f"[触发] mode={mode!r}  来源=快捷键或按钮")
-
-        # ── 全局单例锁：选区遮罩打开期间忽略所有重复热键 ──
-        if getattr(self, "_capturing", False) and mode != "gen_qr":
-            _hklog(f"[忽略] 正在框选中，跳过 mode={mode!r}")
-            return
-
-        # 关闭上一次未关的结果弹窗
-        old = getattr(self, "_active_popup", None)
-        if old:
-            try:
-                old.destroy()
-            except Exception:
-                pass
-            self._active_popup = None
-
         cb_map = {
             "ocr":        self._run_ocr_only,
             "translate":  self._run_ocr_translate,
@@ -1369,23 +1142,16 @@ class CompactBar(tk.Tk):
             "qrcode":     "识别二维码",
             "gen_qr":     "生成二维码",
         }
-        action  = cb_map.get(mode, self._run_ocr_only)
-        m_name  = name_map.get(mode, "")
+        action = cb_map.get(mode, self._run_ocr_only)
+        m_name = name_map.get(mode, "")
 
         if mode == "gen_qr":
             self.after(0, action)
         else:
-            # 设置锁；用 wrapper 确保 callback 完成时释放锁（无论成功或 cancel）
-            self._capturing = True
-            original_action = action
-            def _action_done(*args, **kwargs):
-                self._capturing = False
-                original_action(*args, **kwargs)
-            self.after(200, lambda: grab_region(self, _action_done, mode_name=m_name))
-
+            self.after(200, lambda: grab_region(self, action, mode_name=m_name))
 
     # ── 提取文字（OCR 复制）────────────────
-    def _run_ocr_only(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300, crop_img=None):
+    def _run_ocr_only(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
         def _main():
             def worker():
                 text = do_ocr(img_path)
@@ -1398,7 +1164,7 @@ class CompactBar(tk.Tk):
         self.after(0, _main)
 
     # ── 截图到剪贴板 ─────────────────────────
-    def _run_screenshot(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300, crop_img=None):
+    def _run_screenshot(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
         import subprocess
         def _main():
             try:
@@ -1412,14 +1178,12 @@ class CompactBar(tk.Tk):
                 self.after(0, lambda: self._toast(f"截图失败: {ex}"))
         self.after(0, _main)
 
-    # ── OCR + 翻译 ───────────────────────
-    def _run_ocr_translate(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300, crop_img=None):
+    # ── OCR + 翻译 ───────────────────────────
+    def _run_ocr_translate(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
         def _main():
             engine = self.engine_var.get()
             lang   = self.lang_var.get()
-            popup  = InPlaceOverlay(self, lx1, ly1, lx2, ly2, mode="translate",
-                                    bg_img=crop_img, dpi_scale=self._dpi_scale)
-            self._active_popup = popup   # 登记当前弹窗
+            popup  = InPlaceOverlay(self, lx1, ly1, lx2, ly2, mode="translate")
 
             def worker():
                 # 使用 raw 返回来保留左、右、上、下的真实坐标点阵
@@ -1450,7 +1214,7 @@ class CompactBar(tk.Tk):
         self.after(0, _main)
 
     # ── 扫码（微信 OpenCV QR） ────────────────
-    def _run_qrcode(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300, crop_img=None):
+    def _run_qrcode(self, img_path, lx1=0, ly1=0, lx2=400, ly2=300):
         def _main():
             def worker():
                 try:
@@ -1500,11 +1264,7 @@ class CompactBar(tk.Tk):
         w.title("生成二维码")
         w.configure(bg="#1e1e2e")
         w.attributes("-topmost", True)
-        w.resizable(False, False)
         w.geometry(f"320x420+{self.winfo_x()}+{self.winfo_y() + self.winfo_height() + 10}")
-        self._active_popup = w     # 单例登记
-        w.protocol("WM_DELETE_WINDOW", lambda: (w.destroy(), setattr(self, '_active_popup', None)))
-        w.bind("<Escape>", lambda e: (w.destroy(), setattr(self, '_active_popup', None)))
 
         img_lbl = tk.Label(w, bg="#1e1e2e")
         img_lbl.pack(pady=20)
@@ -1527,32 +1287,20 @@ class CompactBar(tk.Tk):
         
         def _update_qr(*_):
             text = entry.get().strip() or "empty"
-            try:
-                qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M,
-                                   box_size=4, border=2)
-                qr.add_data(text)
-                qr.make(fit=True)
-                img = qr.make_image(fill_color="black", back_color="white")
-                # 固定显示尺寸 260x260，避免满屏
-                pil_img = img.get_image() if hasattr(img, 'get_image') else img
-                pil_img = pil_img.resize((260, 260), Image.LANCZOS)
-            except Exception:
-                import qrcode as _qr
-                qr2 = _qr.QRCode(box_size=4, border=2)
-                qr2.add_data(text)
-                qr2.make(fit=True)
-                pil_img = qr2.make_image(fill_color="black", back_color="white")
-                from PIL import Image as _PImage
-                pil_img = pil_img.resize((260, 260), _PImage.LANCZOS)
-
+            qr = qrcode.QRCode(version=1, box_size=8, border=2)
+            qr.add_data(text)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            
             # 保存到临时文件
             img_path = os.path.join(_WRITE_DIR, "_temp_qr.png")
-            pil_img.save(img_path)
-
-            photo = ImageTk.PhotoImage(pil_img)
+            img.save(img_path)
+            
+            photo = ImageTk.PhotoImage(img)
             img_lbl.config(image=photo)
-            img_lbl.image = photo
+            img_lbl.image = photo 
             img_lbl.qr_path = img_path
+            
         def _copy_img():
             import subprocess
             path = getattr(img_lbl, 'qr_path', '')
@@ -1606,7 +1354,7 @@ class CompactBar(tk.Tk):
     def status(self, msg: str): pass   # stub
 
     def destroy(self):
-        try: getattr(self, '_hotkey_mgr', None) and self._hotkey_mgr.stop()
+        try: keyboard.unhook_all()
         except Exception: pass
         super().destroy()
 
