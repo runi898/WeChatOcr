@@ -831,7 +831,10 @@ class Win32HotkeyManager:
         parts = str(hk_str).lower().split('+')
         # MOD_ALT=1, MOD_CTRL=2, MOD_SHIFT=4, MOD_WIN=8
         vk_map = {'page up': 0x21, 'page down': 0x22, 'end': 0x23, 'home': 0x24,
-                  'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28, 'enter': 0x0D, 'esc': 0x1B}
+                  'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28, 'enter': 0x0D, 'esc': 0x1B,
+                  'num 0': 0x60, 'num 1': 0x61, 'num 2': 0x62, 'num 3': 0x63,
+                  'num 4': 0x64, 'num 5': 0x65, 'num 6': 0x66, 'num 7': 0x67,
+                  'num 8': 0x68, 'num 9': 0x69}
         for p in parts:
             p = p.strip()
             if not p: continue
@@ -1139,12 +1142,12 @@ class CompactBar(tk.Tk):
                 # 强制修复 Windows 下由于按住 Alt 导致的键位识别错乱 (比如变成 `??` 或被当成 ascii 自定义输入)
                 if getattr(e, "keycode", 0):
                     if 96 <= e.keycode <= 105:
-                        k = f"numpad{e.keycode - 96}"
+                        k = f"num {e.keycode - 96}"
                     elif 48 <= e.keycode <= 57:
                         k = str(e.keycode - 48)
                 if k.startswith("mouse") or not k: return "break"
                 
-                km = {"prior": "page up", "next": "page down", "return": "enter", "escape": "esc", "kp_1": "numpad1", "kp_2": "numpad2", "kp_3": "numpad3", "kp_4": "numpad4", "kp_5": "numpad5", "kp_6": "numpad6", "kp_7": "numpad7", "kp_8": "numpad8", "kp_9": "numpad9", "kp_0": "numpad0"}
+                km = {"prior": "page up", "next": "page down", "return": "enter", "escape": "esc", "kp_1": "num 1", "kp_2": "num 2", "kp_3": "num 3", "kp_4": "num 4", "kp_5": "num 5", "kp_6": "num 6", "kp_7": "num 7", "kp_8": "num 8", "kp_9": "num 9", "kp_0": "num 0"}
                 k = km.get(k, k)
                 hk = "+".join(mods + [k])
                 entry.delete(0, tk.END)
