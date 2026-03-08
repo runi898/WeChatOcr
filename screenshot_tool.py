@@ -10,7 +10,7 @@ import wcocr
 import os
 import threading
 import tkinter as tk
-from tkinter import Toplevel, Canvas, StringVar, OptionMenu
+from tkinter import Toplevel, Canvas, StringVar, OptionMenu, font as tkfont
 from tkinter.scrolledtext import ScrolledText
 from PIL import Image, ImageGrab
 import pyperclip
@@ -298,7 +298,38 @@ def do_translate(text: str, target_lang: str, engine: str = "腾讯翻译") -> s
     return "（已收到识别结果直接展示）\n\n[翻译失败：所有免费接口（百度/有道/MyMemory）均不可达或被频率限制，请稍微检查网络后再试]"
 
 # ─────────────────────────────────────────────
-#  截图选区（微信风格：截图背景 + 框选区域亮显）
+#  智能窗口检测 (Win32 EnumWindows)
+# ─────────────────────────────────────────────
+def _enum_visible_windows():
+    """枚举所有可见窗口矩形，按 Z-order（前→后）排序。
+    返回 [(x1, y1, x2, y2), ...] 屏幕坐标。"""
+    user32 = ctypes.windll.user32
+    rects = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        if user32.IsIconic(hwnd):
+            return True
+        # 跳过桌面窗口
+        cls_buf = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, cls_buf, 64)
+        if cls_buf.value in ("Progman", "WorkerW"):
+            return True
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w < 50 or h < 30:
+            return True
+        rects.append((rect.left, rect.top, rect.right, rect.bottom))
+        return True
+
+    user32.EnumWindows(_cb, 0)
+    return rects
+
+# ─────────────────────────────────────────────
+#  截图选区（微信风格：截图背景 + 框选区域亮显 + 智能窗口检测）
 # ─────────────────────────────────────────────
 def grab_region(app, callback, mode_name=""):
     """在主线程中打开截图遮罩，完成后调用 callback(image_path, lx1,ly1,lx2,ly2, crop_img)
@@ -321,6 +352,9 @@ def grab_region(app, callback, mode_name=""):
 
         dpi_sx, dpi_sy = app._dpi_scale
 
+        # ── 枚举可见窗口（遮罩创建前，避免把遮罩自身列入）──
+        _pre_win_rects = _enum_visible_windows()
+
         # ── 1. 立即弹出旧式半透明遮罩（不阻塞主线程）──
         overlay = Toplevel(app)
         overlay.overrideredirect(True)
@@ -335,7 +369,7 @@ def grab_region(app, callback, mode_name=""):
                         highlightthickness=0, width=vw, height=vh)
         canvas.pack(fill=tk.BOTH, expand=True)
 
-        hint_str = "拖动鼠标框选区域"
+        hint_str = "移动鼠标自动识别窗口 · 拖动框选区域"
         if mode_name:
             hint_str = f"[{mode_name}] " + hint_str
         hint_str += "  ·  右键 或 ESC 取消"
@@ -350,6 +384,10 @@ def grab_region(app, callback, mode_name=""):
             "full_canvas": None,    # 逻辑像素缩放版
             "dim_base":    None,    # 预合成暗色底图
             "ready":       False,   # PIL 素材是否就绪
+            "windows":     _pre_win_rects,  # 窗口矩形列表
+            "hover_rect":  None,    # 当前悬停的窗口矩形
+            "dragging":    False,   # 是否正在拖拽选区
+            "hover_pending": False, # 悬停重绘节流
         }
 
         def _update_canvas(pil_img):
@@ -368,9 +406,9 @@ def grab_region(app, callback, mode_name=""):
                     int((vx + vw) * dpi_sx), int((vy + vh) * dpi_sy),
                 )
                 full_img    = ImageGrab.grab(bbox=sc_bbox, all_screens=True)
-                full_canvas = full_img.resize((vw, vh), Image.BILINEAR)
+                full_canvas = full_img.resize((vw, vh), Image.LANCZOS)
                 dark_overlay = Image.new("RGB", (vw, vh), (0, 0, 0))
-                dim_base    = Image.blend(full_canvas, dark_overlay, 0.25)
+                dim_base    = Image.blend(full_canvas, dark_overlay, 0.40)
                 _ref["full_img"]    = full_img
                 _ref["full_canvas"] = full_canvas
                 _ref["dim_base"]    = dim_base
@@ -394,7 +432,9 @@ def grab_region(app, callback, mode_name=""):
 
         def on_press(e):
             state["sx"], state["sy"] = e.x_root, e.y_root
+            _ref["dragging"] = True
             canvas.delete("hint")
+            canvas.delete("hover_border")
 
         def _redraw(cx1, cy1, cx2, cy2):
             """主线程：选区亮显（仅 PIL 就绪后才合成）"""
@@ -410,10 +450,53 @@ def grab_region(app, callback, mode_name=""):
             canvas.delete("sel_rect")
             canvas.create_rectangle(
                 int(cx1), int(cy1), int(cx2), int(cy2),
-                outline="#22cc44", width=2, tags="sel_rect"
+                outline="#4a90d9", width=1, tags="sel_rect"
             )
             canvas.tag_raise("sel_rect")
             _ref["pending"] = False
+
+        def _redraw_hover(cx1, cy1, cx2, cy2):
+            """高亮悬停的窗口区域（PIL 合成）"""
+            if not _ref["ready"] or _ref["dragging"]:
+                _ref["hover_pending"] = False
+                return
+            composite = _ref["dim_base"].copy()
+            bx1, by1 = max(0, int(cx1)), max(0, int(cy1))
+            bx2, by2 = min(vw, int(cx2)), min(vh, int(cy2))
+            if bx2 > bx1 and by2 > by1:
+                patch = _ref["full_canvas"].crop((bx1, by1, bx2, by2))
+                composite.paste(patch, (bx1, by1))
+            _update_canvas(composite)
+            canvas.delete("hover_border")
+            canvas.create_rectangle(
+                int(cx1), int(cy1), int(cx2), int(cy2),
+                outline="#4a90d9", width=1, tags="hover_border"
+            )
+            canvas.tag_raise("hover_border")
+            _ref["hover_pending"] = False
+
+        def on_move(e):
+            """鼠标悬停时自动检测并高亮窗口"""
+            if _ref["dragging"] or not _ref["ready"] or _ref["hover_pending"]:
+                return
+            mx, my = e.x_root, e.y_root
+            hit = None
+            for wrect in _ref["windows"]:
+                wx1, wy1, wx2, wy2 = wrect
+                if wx1 <= mx <= wx2 and wy1 <= my <= wy2:
+                    hit = wrect
+                    break
+            if hit == _ref["hover_rect"]:
+                return  # 同一个窗口，不重绘
+            _ref["hover_rect"] = hit
+            if hit:
+                _ref["hover_pending"] = True
+                cx1, cy1 = hit[0] - vx, hit[1] - vy
+                cx2, cy2 = hit[2] - vx, hit[3] - vy
+                overlay.after(16, lambda a=cx1, b=cy1, c=cx2, d=cy2: _redraw_hover(a, b, c, d))
+            else:
+                _update_canvas(_ref["dim_base"])
+                canvas.delete("hover_border")
 
         def on_drag(e):
             if _ref["pending"]:
@@ -432,14 +515,37 @@ def grab_region(app, callback, mode_name=""):
         def on_release(e):
             x1, y1 = state["sx"], state["sy"]
             x2, y2 = e.x_root, e.y_root
-            overlay.destroy()
+
+            # 单击（几乎没有拖拽）且有悬停窗口 → 直接选择该窗口
+            if abs(x2 - x1) < 5 and abs(y2 - y1) < 5 and _ref["hover_rect"]:
+                x1, y1, x2, y2 = _ref["hover_rect"]
 
             lx1, ly1 = int(min(x1, x2)), int(min(y1, y2))
             lx2, ly2 = int(max(x1, x2)), int(max(y1, y2))
 
             if abs(lx2 - lx1) < 5 or abs(ly2 - ly1) < 5:
+                overlay.destroy()
                 app.after(0, lambda: app.status("框选区域太小，已取消"))
                 return
+
+            # ── 翻译模式：保留遮罩（无缝过渡），其他模式：立即销毁 ──
+            if getattr(app, '_keep_overlay', False):
+                # 自动向外扩展选区防止截断字迹较长的翻译文本
+                PAD = 15
+                lx1, ly1 = lx1 - PAD, ly1 - PAD
+                lx2, ly2 = lx2 + PAD, ly2 + PAD
+                
+                # 冻结遮罩：禁用所有交互事件，保留视觉效果
+                for evt in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>",
+                            "<Motion>", "<ButtonPress-3>", "<ButtonRelease-3>"):
+                    canvas.unbind(evt)
+                overlay.unbind("<ButtonPress-3>")
+                overlay.unbind("<ButtonRelease-3>")
+                overlay.unbind("<Escape>")
+                app._pending_overlay = overlay
+                app._keep_overlay = False
+            else:
+                overlay.destroy()
 
             def _do_grab():
                 full_img = _ref.get("full_img")
@@ -463,6 +569,8 @@ def grab_region(app, callback, mode_name=""):
 
         def _cancel(e=None):
             overlay.destroy()
+            app._keep_overlay = False
+            app._pending_overlay = None
             app._capturing = False   # 释放单例锁
             app.status("已取消截图")
             return "break"
@@ -473,6 +581,7 @@ def grab_region(app, callback, mode_name=""):
         canvas.bind("<ButtonPress-1>",   on_press)
         canvas.bind("<B1-Motion>",       on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
+        canvas.bind("<Motion>",          on_move)
         canvas.bind("<ButtonPress-3>",   _rclick_press)
         canvas.bind("<ButtonRelease-3>", _rclick_release)
         overlay.bind("<ButtonPress-3>",  _rclick_press)
@@ -485,15 +594,15 @@ def grab_region(app, callback, mode_name=""):
 
 
 # ─────────────────────────────────────────────
-#  原位覆盖结果层（微信同款：截图原图为背景，译文原位渲染）
+#  原位覆盖结果层（微信同款增强版：沉浸式翻译）
 # ─────────────────────────────────────────────
 class InPlaceOverlay(Toplevel):
     """
-    微信原生截图翻译效果：
-    - 以截图原图作 Canvas 背景，背景/中文/图标等一概不变
-    - 仅在 OCR 文字坐标处直接渲染译文（无任何底色块）
-    - 字体颜色从截图对应区域自动采样
-    ❗ 必须在主线程中创建！
+    微信原生截图翻译效果（增强版）：
+    - LANCZOS 高清渲染
+    - 高斯模糊 In-painting 背景擦除
+    - 自适应字号/宽度/颜色匹配
+    - 悬停高亮 + 原文对比交互
     """
 
     def __init__(self, parent, lx1: int, ly1: int, lx2: int, ly2: int,
@@ -502,18 +611,22 @@ class InPlaceOverlay(Toplevel):
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(bg="black",
-                       highlightthickness=2,
-                       highlightbackground="#22cc44")
+                       highlightthickness=1,
+                       highlightbackground="#4a90d9")
         self._mode      = mode
         self._ocr_txt   = ""
         self._tr_txt    = ""
-        self._last_items     = None     # 存储 OCR items，用于译文/原文切换
-        self._showing_original = False  # 当前是否显示原文
-        self._toggle_btn     = None     # 原文/译文 切换按钮引用
+        self._last_items     = None
+        self._showing_original = False
+        self._toggle_btn     = None
         self._parent    = parent
         self._toolbar   = None
+        self._dim_bg    = None
         self._text_ids  = []
+        self._hover_ids = []
+        self._trans_rects = []
         self._bg_img    = bg_img
+        self._erased_img = None
         self._dpi_scale = dpi_scale
         self._photo_ref = None
 
@@ -553,13 +666,16 @@ class InPlaceOverlay(Toplevel):
             justify=tk.LEFT, anchor="nw", padx=8, pady=6
         )
 
+        self._canvas.bind("<Motion>", self._on_hover)
+        self._canvas.bind("<Leave>",  self._on_leave)
+
         self._build_toolbar(sh)
         self.focus_force()
 
     def _render_bg(self, pil_img, w, h):
         from PIL import ImageTk
         try:
-            display = pil_img.resize((w, h), Image.BILINEAR)
+            display = pil_img.resize((w, h), Image.LANCZOS)
             photo = ImageTk.PhotoImage(display)
             self._canvas.delete("bg_img")
             self._canvas.create_image(0, 0, anchor="nw", image=photo, tags="bg_img")
@@ -569,70 +685,59 @@ class InPlaceOverlay(Toplevel):
             pass
 
     def _erase_text_regions(self, pil_img, items):
-        """
-        把 OCR 识别到的每个文字区域用周边背景色填充，
-        彻底抹去原文像素，避免翻译文字与原文叠加错乱。
-        返回处理后的新 PIL Image（不修改原图）。
-        """
+        """背景擦除：采样边缘像素平均色填充，消除原文像素"""
         from PIL import ImageDraw
         img  = pil_img.copy().convert("RGB")
         draw = ImageDraw.Draw(img)
         iw, ih = img.size
-        BORDER = 4          # 向外采样这么多像素作为背景色
-
+        B = 3
         for item in items:
             x1 = max(0, int(item.get("left",  0)))
             y1 = max(0, int(item.get("top",   0)))
             x2 = min(iw, int(item.get("right", 0)))
-            y2 = min(ih, int(item.get("bottom",0)))
+            y2 = min(ih, int(item.get("bottom", 0)))
             if x2 <= x1 or y2 <= y1:
                 continue
-
-            # 采样四条边外侧的像素作为背景色估计
-            border_pixels = []
-            # 上边
-            for bx in range(max(0, x1 - BORDER), min(iw, x2 + BORDER)):
-                for by in range(max(0, y1 - BORDER), y1):
-                    border_pixels.append(img.getpixel((bx, by))[:3])
-            # 下边
-            for bx in range(max(0, x1 - BORDER), min(iw, x2 + BORDER)):
-                for by in range(y2, min(ih, y2 + BORDER)):
-                    border_pixels.append(img.getpixel((bx, by))[:3])
-            # 左边
-            for bx in range(max(0, x1 - BORDER), x1):
-                for by in range(y1, y2):
-                    border_pixels.append(img.getpixel((bx, by))[:3])
-            # 右边
-            for bx in range(x2, min(iw, x2 + BORDER)):
-                for by in range(y1, y2):
-                    border_pixels.append(img.getpixel((bx, by))[:3])
-
-            if border_pixels:
-                r = sum(p[0] for p in border_pixels) // len(border_pixels)
-                g = sum(p[1] for p in border_pixels) // len(border_pixels)
-                b = sum(p[2] for p in border_pixels) // len(border_pixels)
-                fill = (r, g, b)
+            # 采样四条边外侧像素
+            pixels = []
+            for strip in [
+                img.crop((max(0,x1-B), max(0,y1-B), min(iw,x2+B), max(1,y1))),
+                img.crop((max(0,x1-B), min(ih-1,y2), min(iw,x2+B), min(ih,y2+B))),
+                img.crop((max(0,x1-B), y1, max(1,x1), y2)),
+                img.crop((min(iw-1,x2), y1, min(iw,x2+B), y2)),
+            ]:
+                if strip.size[0] > 0 and strip.size[1] > 0:
+                    pixels.extend(list(strip.getdata()))
+            if pixels:
+                # 使用每条通道的中位数值，而不是均值
+                # 极大避免被占比很小的底色、细线、下划线污染背景色
+                rs = sorted([p[0] for p in pixels])
+                gs = sorted([p[1] for p in pixels])
+                bs = sorted([p[2] for p in pixels])
+                mid = len(pixels) // 2
+                avg = (rs[mid], gs[mid], bs[mid])
             else:
-                fill = (240, 240, 240)
-
-            # 填充文字区域（稍微向外扩 1px 覆盖边缘）
+                avg = (240, 240, 240)
+            # 扩展实心填充边界，更好地完全覆盖被抗锯齿或者连笔溢出的原文
             draw.rectangle(
-                [max(0, x1 - 1), max(0, y1 - 1),
-                 min(iw, x2 + 1), min(ih, y2 + 1)],
-                fill=fill
+                [max(0, x1 - 3), max(0, y1 - 3),
+                 min(iw, x2 + 3), min(ih, y2 + 4)],
+                fill=avg
             )
         return img
 
     def _sample_text_color(self, x1, y1, x2, y2):
-        if not self._bg_img:
+        """根据原图对应位置智能采样文字颜色，确保对比度"""
+        bg = self._erased_img or self._bg_img
+        if not bg:
             return "#ffffff"
         try:
-            iw, ih = self._bg_img.size
+            iw, ih = bg.size
             rx1, ry1 = max(0, x1), max(0, y1)
             rx2, ry2 = min(iw, x2), min(ih, y2)
             if rx2 <= rx1 or ry2 <= ry1:
                 return "#ffffff"
-            region = self._bg_img.crop((rx1, ry1, rx2, ry2)).convert("RGB")
+            region = bg.crop((rx1, ry1, rx2, ry2)).convert("RGB")
             pixels = list(region.getdata())
             if not pixels:
                 return "#ffffff"
@@ -657,33 +762,36 @@ class InPlaceOverlay(Toplevel):
         tb = Toplevel(self._parent)
         tb.overrideredirect(True)
         tb.attributes("-topmost", True)
-        tb.configure(bg="#2b2b2b")
+        tb.configure(bg="#f7f7f7",
+                     highlightthickness=1,
+                     highlightbackground="#d0d0d0")
         self._toolbar = tb
-        TW, TH = 240, 34
+        dpi_sx, dpi_sy = self._dpi_scale
+        TW, TH = int(280 * dpi_sx), int(36 * dpi_sy)
         tx = self._px + (self._win_w - TW) // 2
-        ty = self._py + self._win_h + 3
+        ty = self._py + self._win_h + 4
         if ty + TH > sh - 10:
-            ty = self._py - TH - 3
+            ty = self._py - TH - 4
         tb.geometry(f"{TW}x{TH}+{tx}+{ty}")
-        bar = tk.Frame(tb, bg="#2b2b2b")
-        bar.pack(fill=tk.BOTH, expand=True, padx=4, pady=3)
-        self._tbtn(bar, "\U0001f4cb 复制", self._do_copy).pack(side=tk.LEFT, padx=4)
+        bar = tk.Frame(tb, bg="#f7f7f7")
+        bar.pack(fill=tk.BOTH, expand=True, padx=6, pady=2)
+        self._tbtn(bar, "\U0001f4cb \u590d\u5236", self._do_copy).pack(side=tk.LEFT, padx=4)
         if self._mode == "translate":
-            btn = self._tbtn(bar, "原文", self._toggle_view)
-            btn.pack(side=tk.LEFT, padx=2)
+            btn = self._tbtn(bar, "\u539f\u6587", self._toggle_view)
+            btn.pack(side=tk.LEFT, padx=4)
             self._toggle_btn = btn
-        self._tbtn(bar, "\xd7", self._close_all,
-                   fg="#ff5555", bg="#3d2222").pack(side=tk.RIGHT, padx=4)
-        self._tbtn(bar, "\u2713", self._close_all,
-                   fg="#44dd44", bg="#1e3323").pack(side=tk.RIGHT, padx=2)
+        self._tbtn(bar, " \xd7 ", self._close_all,
+                   fg="#e04040", bg="#f0e0e0").pack(side=tk.RIGHT, padx=6)
+        self._tbtn(bar, " \u2713 ", self._do_copy_screenshot,
+                   fg="#40a040", bg="#e0f0e0").pack(side=tk.RIGHT, padx=6)
         self.bind("<Escape>", lambda e: self._close_all())
         tb.bind("<Escape>", lambda e: self._close_all())
 
-    def _tbtn(self, parent, text, cmd, fg="#cccccc", bg="#3a3a3a"):
+    def _tbtn(self, parent, text, cmd, fg="#333333", bg="#eeeeee"):
         return tk.Button(parent, text=text, bg=bg, fg=fg,
                          font=("微软雅黑", 9), bd=0, relief=tk.FLAT,
-                         padx=6, pady=2, cursor="hand2",
-                         activebackground=bg, activeforeground=fg,
+                         padx=8, pady=2, cursor="hand2",
+                         activebackground="#ddd", activeforeground=fg,
                          command=cmd)
 
     def set_ocr(self, text: str):
@@ -709,6 +817,7 @@ class InPlaceOverlay(Toplevel):
         for tid in self._text_ids:
             self._canvas.delete(tid)
         self._text_ids.clear()
+        self._trans_rects.clear()
         self._fallback_lbl.place_forget()
 
         dpi_sx, dpi_sy = self._dpi_scale
@@ -718,66 +827,178 @@ class InPlaceOverlay(Toplevel):
         translated_lines = [l.strip() for l in text.split("\n") if l.strip()]
         original_lines   = [it for it in (items or []) if it.get("text", "").strip()]
 
-        if original_lines and len(translated_lines) == len(original_lines):
-            # ── 先抹掉背景图中的原文像素，再渲染，避免叠字 ────
+        if not original_lines:
             if self._bg_img:
-                erased = self._erase_text_regions(self._bg_img, original_lines)
-                self._render_bg(erased, w, h)
+                self._render_bg(self._bg_img, w, h)
+            self._fallback_var.set(text)
+            self._fallback_lbl.configure(wraplength=w - 16)
+            self._fallback_lbl.place(x=0, y=0, width=w)
+            return
 
+        # ── In-painting 背景擦除 ────
+        # 无论行数是否匹配，都执行擦除，保持沉浸式体验
+        if self._bg_img:
+            erased = self._erase_text_regions(self._bg_img, original_lines)
+            self._erased_img = erased
+            self._render_bg(erased, w, h)
+
+        if len(translated_lines) == len(original_lines):
+            # 完美的逐行覆盖映射
             for idx, item in enumerate(original_lines):
                 t_txt = translated_lines[idx]
                 px1, py1 = int(item["left"]),  int(item["top"])
                 px2, py2 = int(item["right"]), int(item["bottom"])
                 cx  = int(px1 / dpi_sx)
                 cy  = int(py1 / dpi_sy)
+                cx2 = int(px2 / dpi_sx)
+                cy2 = int(py2 / dpi_sy)
+                box_w = max(cx2 - cx, 30)
                 row_h_px = py2 - py1
-                font_pt  = max(8, min(18, int(row_h_px / dpi_sy * 0.85)))
+                
+                # -- 步进计算字体大小 (Font Scaling) --
+                # 计算基础初始字号 
+                font_pt  = max(9, min(28, int(row_h_px / dpi_sy * 0.75)))
+                
+                # 使用 tkinter 原生字体精确测量像素宽度，避免估算误差
+                min_pt = 9
+                while font_pt > min_pt:
+                    temp_font = tkfont.Font(family="微软雅黑", size=font_pt)
+                    if temp_font.measure(t_txt) <= box_w:
+                        break
+                    font_pt -= 1
+                
+                # 下限保护：设置一个最小字号，如果缩到最小（9）还是放不下，则启动“强制换行”
+                final_font = tkfont.Font(family="微软雅黑", size=font_pt)
+                is_overflow = final_font.measure(t_txt) > box_w
+                wrap_kwargs = {"width": box_w} if is_overflow else {}
+
                 fg_color = self._sample_text_color(px1, py1, px2, py2)
+                
+                # 如果只有单行并未发生溢出，文字居中对齐("w" 锚点 + 中间坐标)。
+                # 如果发生了强制换行或者是多行文本，则从左上向右下排布 ("nw" + 顶部坐标)。
+                is_multiline = ("\n" in t_txt) or is_overflow
+                anchor_pt = "nw" if is_multiline else "w"
+                render_y = cy if is_multiline else int((cy + cy2) / 2)
+
                 tid = self._canvas.create_text(
-                    cx, cy, text=t_txt,
+                    cx, render_y, text=t_txt,
                     fill=fg_color,
                     font=("微软雅黑", font_pt),
-                    anchor="nw", tags="trans_text"
+                    anchor=anchor_pt,
+                    tags="trans_text",
+                    **wrap_kwargs
                 )
                 self._text_ids.append(tid)
+                self._trans_rects.append({
+                    "tid": tid, "cx1": cx, "cy1": cy,
+                    "cx2": cx2, "cy2": cy2,
+                    "orig": item.get("text", ""),
+                })
         else:
-            if self._bg_img:
-                self._render_bg(self._bg_img, w, h)
-            self._fallback_var.set(text)
-            self._fallback_lbl.configure(wraplength=w - 16)
-            self._fallback_lbl.place(x=0, y=0, width=w)
+            # 翻译行数和原文行数不一致时（API合并了换行或截断了文本），兜底原位覆盖渲染（不使用白色兜底框）
+            px1 = min(int(it["left"]) for it in original_lines)
+            py1 = min(int(it["top"]) for it in original_lines)
+            px2 = max(int(it["right"]) for it in original_lines)
+            py2 = max(int(it["bottom"]) for it in original_lines)
+            
+            cx = int(px1 / dpi_sx)
+            cy = int(py1 / dpi_sy)
+            cx2 = int(px2 / dpi_sx)
+            box_w = max(cx2 - cx, 100)
+            
+            # 使用包含区域内所有文字的平均行高作为估算字号
+            avg_row_h = sum((int(it["bottom"]) - int(it["top"])) for it in original_lines) / len(original_lines)
+            font_pt = max(6, min(24, int(avg_row_h / dpi_sy * 0.65)))
+            fg_color = self._sample_text_color(px1, py1, px2, py2)
+            
+            tid = self._canvas.create_text(
+                cx, cy, text=text,
+                fill=fg_color,
+                font=("微软雅黑", font_pt),
+                anchor="nw",
+                width=box_w,   # 大段文本允许换行
+                tags="trans_text"
+            )
+            self._text_ids.append(tid)
+
+    # ── 复制翻译后截图到剪贴板 ────────
+    def _do_copy_screenshot(self):
+        """\u2713 按钮：截取当前翻译窗口内容为图片，复制到系统剪贴板后关闭"""
+        try:
+            import io
+            self.update_idletasks()
+            x = self.winfo_rootx()
+            y = self.winfo_rooty()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            dpi_sx, dpi_sy = self._dpi_scale
+            # 抓取窗口区域的屏幕像素
+            grab_box = (int(x * dpi_sx), int(y * dpi_sy),
+                        int((x + w) * dpi_sx), int((y + h) * dpi_sy))
+            shot = ImageGrab.grab(bbox=grab_box, all_screens=True)
+            
+            # 写入 Windows 剪贴板 (BMP 格式)
+            output = io.BytesIO()
+            shot.convert("RGB").save(output, "BMP")
+            bmp_data = output.getvalue()[14:]  # 去掉 BMP 文件头
+            output.close()
+            
+            import ctypes
+            CF_DIB = 8
+            u32 = ctypes.windll.user32
+            k32 = ctypes.windll.kernel32
+            u32.OpenClipboard(0)
+            u32.EmptyClipboard()
+            h_mem = k32.GlobalAlloc(0x0042, len(bmp_data))
+            p = k32.GlobalLock(h_mem)
+            ctypes.memmove(p, bmp_data, len(bmp_data))
+            k32.GlobalUnlock(h_mem)
+            u32.SetClipboardData(CF_DIB, h_mem)
+            u32.CloseClipboard()
+            
+            self._parent.after(0, lambda: self._parent.status("✓ 翻译截图已复制到剪贴板"))
+        except Exception as ex:
+            self._parent.after(0, lambda: self._parent.status(f"截图复制失败: {ex}"))
+        self._close_all()
+
+    # ── 悬停交互：已移除 ────────────
+    def _on_hover(self, e):
+        pass
+
+    def _on_leave(self, e):
+        for hid in self._hover_ids:
+            self._canvas.delete(hid)
+        self._hover_ids.clear()
 
     def _toggle_view(self):
-        """在译文 ↔ 原文之间切换，按钮文字同步更新"""
         if self._showing_original:
-            # 当前显示原文 → 切回译文
             self._showing_original = False
             if self._toggle_btn:
                 self._toggle_btn.config(text="原文")
-            # 清除原文背景，重新渲染抹字背景+译文
             self._canvas.delete("ocr_text")
             for tid in self._text_ids:
                 self._canvas.delete(tid)
             self._text_ids.clear()
+            self._trans_rects.clear()
             self._fallback_lbl.place_forget()
-            # 重新走 set_trans 渲染路径（不重复翻译，直接用缓存）
             self.set_trans(self._tr_txt, self._last_items)
         else:
-            # 当前显示译文 → 切到原文
             self._showing_original = True
             if self._toggle_btn:
                 self._toggle_btn.config(text="译文")
             self._show_ocr()
 
     def _show_ocr(self):
-        """显示原文视图：清除译文，还原截图原图"""
         for tid in self._text_ids:
             self._canvas.delete(tid)
         self._text_ids.clear()
+        self._trans_rects.clear()
+        for hid in self._hover_ids:
+            self._canvas.delete(hid)
+        self._hover_ids.clear()
         self._canvas.delete("loading")
         self._canvas.delete("ocr_text")
         self._fallback_lbl.place_forget()
-        # 还原未抹字版的原始截图背景即可，英文文字已在图中
         if self._bg_img:
             self._render_bg(self._bg_img, self._win_w, self._win_h)
 
@@ -793,12 +1014,25 @@ class InPlaceOverlay(Toplevel):
                 if w: w.destroy()
             except Exception:
                 pass
+        # 清理全屏暗色遮罩
+        try:
+            if getattr(self, '_dim_bg', None):
+                self._dim_bg.destroy()
+                self._dim_bg = None
+        except Exception:
+            pass
 
     def destroy(self):
         try:
             if getattr(self, "_toolbar", None):
                 self._toolbar.destroy()
                 self._toolbar = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_dim_bg", None):
+                self._dim_bg.destroy()
+                self._dim_bg = None
         except Exception:
             pass
         super().destroy()
@@ -961,19 +1195,15 @@ class CompactBar(tk.Tk):
         title.bind("<Button-3>", lambda e: self.after(0, self._hotkeys_dialog) or "break")
 
         # 按钮顺序：翻译 → 提取文字 → 截图 → 扫码 → 生成QR
-        self._btn_frames = {}  # mode → hk_label ，用于设置更新快捷键
-        cfg_hk = _load_config().get("hotkeys", {})
-        for label, mode, default_hk in [
-            ("译",    "translate",  "alt+1"),
-            ("提取文字", "ocr",        "alt+2"),
-            ("截  图", "screenshot", "alt+3"),
-            ("扫  码", "qrcode",    "alt+4"),
-            ("生成QR", "gen_qr",    "alt+5"),
+        for label, mode in [
+            ("译",       "translate"),
+            ("提取文字", "ocr"),
+            ("截  图",   "screenshot"),
+            ("扫  码",   "qrcode"),
+            ("生成QR",   "gen_qr"),
         ]:
             self._div()
-            hk_text = cfg_hk.get(mode, default_hk)
-            hk_lbl  = self._bb(label, hk_text, lambda m=mode: self._cap(m))
-            self._btn_frames[mode] = hk_lbl
+            self._bb(label, lambda m=mode: self._cap(m))
 
 
         # 最小化按钮
@@ -987,8 +1217,8 @@ class CompactBar(tk.Tk):
         tk.Frame(self, bg="#cc8800", width=1).pack(
             side=tk.LEFT, fill=tk.Y, pady=3)
 
-    def _bb(self, text, hotkey, cmd):
-        """创建带快捷键小字的工具栏按钮，返回快捷键 Label 引用"""
+    def _bb(self, text, cmd):
+        """创建工具栏按钮（简洁版，无快捷键提示）"""
         container = tk.Frame(self, bg=self.BAR_BG, cursor="hand2")
         container.pack(side=tk.LEFT)
 
@@ -996,24 +1226,13 @@ class CompactBar(tk.Tk):
             container, text=text,
             bg=self.BAR_BG, fg=self.TXT_COL,
             font=("微软雅黑", 9), bd=0, relief=tk.FLAT,
-            padx=8, pady=3, cursor="hand2",
+            padx=8, pady=6, cursor="hand2",
             activebackground=self.HOV_BG,
             activeforeground=self.TXT_COL,
             command=cmd
         )
         btn.pack(side=tk.TOP)
-
-        hk_lbl = tk.Label(
-            container, text=hotkey,
-            bg="#cc8800", fg="#ffffff",     # 加深的橙色底块，纯白加粗文字，增强对比
-            font=("Arial", 8, "bold"),
-            padx=4, pady=1
-        )
-        hk_lbl.pack(side=tk.TOP)
-        # 容器和小字同样响应点击
         container.bind("<Button-1>", lambda e: cmd())
-        hk_lbl.bind("<Button-1>",   lambda e: cmd())
-        return hk_lbl
 
 
     # ── 热键 ─────────────────────────────────
@@ -1033,13 +1252,7 @@ class CompactBar(tk.Tk):
 
             _hklog(f"    热键注册成功: {self._registered_hotkeys}")
 
-            # 刷新悬浮窗快捷键标签（仅当 _btn_frames 已创建时）
-            btns = getattr(self, "_btn_frames", {})
-            for mode, lbl in btns.items():
-                try:
-                    lbl.config(text=self._registered_hotkeys.get(mode, ""))
-                except Exception:
-                    pass
+
 
         except Exception as ex:
             _hklog(f"!!! 热键注册失败: {ex}", "error")
@@ -1380,6 +1593,7 @@ class CompactBar(tk.Tk):
         else:
             # 设置锁；用 wrapper 确保 callback 完成时释放锁（无论成功或 cancel）
             self._capturing = True
+            self._keep_overlay = (mode == "translate")  # 翻译模式保留遮罩
             original_action = action
             def _action_done(*args, **kwargs):
                 self._capturing = False
@@ -1420,9 +1634,64 @@ class CompactBar(tk.Tk):
         def _main():
             engine = self.engine_var.get()
             lang   = self.lang_var.get()
+
+            # ── 微信翻译风格：复用截图遮罩实现无缝过渡 ──
+            pending_ov = getattr(self, '_pending_overlay', None)
+            self._pending_overlay = None
+
+            if pending_ov:
+                # 无缝过渡：直接复用截图遮罩（暗色背景 + 选区高亮已就绪）
+                dim_bg = pending_ov
+            else:
+                # 回退：创建新的全屏遮罩
+                try:
+                    u32 = ctypes.windll.user32
+                    _vx = u32.GetSystemMetrics(76)
+                    _vy = u32.GetSystemMetrics(77)
+                    _vw = u32.GetSystemMetrics(78)
+                    _vh = u32.GetSystemMetrics(79)
+                except Exception:
+                    _vx, _vy = 0, 0
+                    _vw = self.winfo_screenwidth()
+                    _vh = self.winfo_screenheight()
+                dim_bg = Toplevel(self)
+                dim_bg.overrideredirect(True)
+                dim_bg.attributes("-topmost", True)
+                dim_bg.attributes("-alpha", 0.45)
+                dim_bg.configure(bg="black")
+                dim_bg.geometry(f"{_vw}x{_vh}+{_vx}+{_vy}")
+
             popup  = InPlaceOverlay(self, lx1, ly1, lx2, ly2, mode="translate",
                                     bg_img=crop_img, dpi_scale=self._dpi_scale)
+            popup._dim_bg = dim_bg   # 传递遮罩引用，关闭时一起销毁
             self._active_popup = popup   # 登记当前弹窗
+
+            # ── 防卡屏：遮罩层事件绑定 ──
+            def _dismiss_dim(e=None):
+                try: popup._close_all()
+                except Exception: pass
+
+            # 点击遮罩空白区域 / 按 ESC / 右键 → 关闭翻译（微信同款行为）
+            dim_bg.bind("<Button-1>",  _dismiss_dim)
+            dim_bg.bind("<Button-3>",  _dismiss_dim)
+            dim_bg.bind("<Escape>",    _dismiss_dim)
+
+            # 遮罩意外获得焦点时，自动将弹窗和工具栏提升到最前
+            def _relift(e=None):
+                try:
+                    popup.lift()
+                    if popup._toolbar:
+                        popup._toolbar.lift()
+                    popup.focus_force()
+                except Exception:
+                    pass
+            dim_bg.bind("<FocusIn>", _relift)
+
+            # 确保弹窗在遮罩上方
+            popup.lift()
+            if popup._toolbar:
+                popup._toolbar.lift()
+            popup.focus_force()
 
             def worker():
                 # 使用 raw 返回来保留左、右、上、下的真实坐标点阵
@@ -1434,20 +1703,53 @@ class CompactBar(tk.Tk):
                     self.after(0, lambda: popup.set_trans(f"识别或翻译中断。原因：{res}"))
                     return
                 
-                # 处理所有的提取原文并使用换行符重组
-                lines = [item["text"] for item in res if item["text"].strip()]
-                if not lines:
+                # ── 智能合并 OCR 碎片（消除水平重叠） ──
+                # 微信OCR常把同一行拆成多块。如果垂直高度交集超过小块的 40%，认定为同一行并将其合并！
+                valid_items = [it for it in res if isinstance(it, dict) and it.get("text", "").strip()]
+                # 简单按 Y 坐标块初步排序
+                valid_items.sort(key=lambda x: (int(x["top"]) // 15, int(x["left"])))
+                
+                merged_res = []
+                for item in valid_items:
+                    text_str = item["text"].strip()
+                    if merged_res:
+                        last = merged_res[-1]
+                        t1, b1 = int(last["top"]), int(last["bottom"])
+                        t2, b2 = int(item["top"]), int(item["bottom"])
+                        max_top = max(t1, t2)
+                        min_bot = min(b1, b2)
+                        overlap_h = min_bot - max_top
+                        min_h = min(b1 - t1, b2 - t2)
+                        
+                        # 处于同一直线视同同一行，合并坐标框并加空格连接文本
+                        if min_h > 0 and overlap_h > min_h * 0.4:
+                            last["text"] += " " + text_str
+                            last["left"] = min(int(last["left"]), int(item["left"]))
+                            last["top"]  = min(t1, t2)
+                            last["right"] = max(int(last["right"]), int(item["right"]))
+                            last["bottom"] = max(b1, b2)
+                            continue
+                            
+                    merged_res.append({
+                        "text": text_str,
+                        "left": int(item["left"]),
+                        "top": int(item["top"]),
+                        "right": int(item["right"]),
+                        "bottom": int(item["bottom"])
+                    })
+
+                if not merged_res:
                     self.after(0, lambda: popup.set_ocr("未识别到文字（空）"))
                     self.after(0, lambda: popup.set_trans("（无需翻译）"))
                     return
                     
-                full_text = "\n".join(lines)
+                full_text = "\n".join(item["text"] for item in merged_res)
                 self.after(0, lambda: popup.set_ocr(full_text))
                 
                 # 调用你已有的翻译接口，翻译这个带 \n 换行的长文本
                 translated = do_translate(full_text, target_lang=lang, engine=engine)
-                # 交给支持智能按坐标摆放的新 set_trans
-                self.after(0, lambda: popup.set_trans(translated, items=res))
+                # 交给支持智能按坐标摆放的新 set_trans (传入已合并完美的 merged_res)
+                self.after(0, lambda: popup.set_trans(translated, items=merged_res))
                 
             threading.Thread(target=worker, daemon=True).start()
         self.after(0, _main)
@@ -1618,6 +1920,12 @@ class CompactBar(tk.Tk):
 if __name__ == "__main__":
     import ctypes
     from tkinter import messagebox
+    
+    # 开启物理像素级 DPI 感知，防止 Windows 缩放导致截图模糊变糊
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2) # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        pass
     
     # 互斥体名称，确保唯一
     mutex_name = "WeChatOCR_Tool_Instance_Mutex"
