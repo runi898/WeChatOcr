@@ -485,7 +485,7 @@ def grab_region(app, callback, mode_name=""):
                     int((vx + vw) * dpi_sx), int((vy + vh) * dpi_sy),
                 )
                 full_img    = ImageGrab.grab(bbox=sc_bbox, all_screens=True)
-                full_canvas = full_img.resize((vw, vh), Image.LANCZOS)
+                full_canvas = full_img.resize((vw, vh), Image.BILINEAR)
                 dark_overlay = Image.new("RGB", (vw, vh), (0, 0, 0))
                 dim_base    = Image.blend(full_canvas, dark_overlay, 0.40)
                 _ref["full_img"]    = full_img
@@ -674,7 +674,7 @@ def grab_region(app, callback, mode_name=""):
 class InPlaceOverlay(Toplevel):
     """
     微信原生截图翻译效果（增强版）：
-    - LANCZOS 高清渲染
+    - BILINEAR 高效渲染
     - 高斯模糊 In-painting 背景擦除
     - 自适应字号/宽度/颜色匹配
     - 悬停高亮 + 原文对比交互
@@ -751,7 +751,7 @@ class InPlaceOverlay(Toplevel):
         from PIL import ImageTk
         try:
             base_h = min(h, self._base_win_h)
-            display = pil_img.resize((w, base_h), Image.LANCZOS)
+            display = pil_img.resize((w, base_h), Image.BILINEAR)
             if h > base_h:
                 pad_color = self._background_pad_color(display)
                 padded = Image.new("RGB", (w, h), pad_color)
@@ -1772,7 +1772,7 @@ class CompactBar(tk.Tk):
             def _action_done(*args, **kwargs):
                 self._capturing = False
                 original_action(*args, **kwargs)
-            self.after(200, lambda: grab_region(self, _action_done, mode_name=m_name))
+            self.after(60, lambda: grab_region(self, _action_done, mode_name=m_name))
 
 
     # ── 提取文字（OCR 复制）────────────────
@@ -2002,7 +2002,7 @@ class CompactBar(tk.Tk):
                 img = qr.make_image(fill_color="black", back_color="white")
                 # 固定显示尺寸 260x260，避免满屏
                 pil_img = img.get_image() if hasattr(img, 'get_image') else img
-                pil_img = pil_img.resize((260, 260), Image.LANCZOS)
+                pil_img = pil_img.resize((260, 260), Image.BILINEAR)
             except Exception:
                 import qrcode as _qr
                 qr2 = _qr.QRCode(box_size=4, border=2)
@@ -2010,7 +2010,7 @@ class CompactBar(tk.Tk):
                 qr2.make(fit=True)
                 pil_img = qr2.make_image(fill_color="black", back_color="white")
                 from PIL import Image as _PImage
-                pil_img = pil_img.resize((260, 260), _PImage.LANCZOS)
+                pil_img = pil_img.resize((260, 260), _PImage.BILINEAR)
 
             # 保存到临时文件
             img_path = os.path.join(_WRITE_DIR, "_temp_qr.png")

@@ -1,0 +1,11 @@
+# WeChatOCR Dependencies
+# Core
+wcocr
+pyperclip
+Pillow
+pystray
+
+# QR Code & Scan
+opencv-contrib-python
+qrcode
+numpy

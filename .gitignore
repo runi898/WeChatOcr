@@ -18,6 +18,14 @@ config.json
 
 # Exclude any other temp files
 *.log
+*.png
+!test_qr.png
 
 # Local worktrees
 .worktrees/
+
+# Agent & Build artifacts
+.claude/
+build-*/
+dist_pending/
+scratch/
